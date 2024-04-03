@@ -23,8 +23,8 @@ type InitBot struct {
 type Config struct {
 	Homeserver string `json:"homeserver"`
 	Botname    string `json:"botname"`
-	Username   string `json:"username"`
-	Auth_token string `json:"auth_token"`
+	Username   string `json:"bot-username"`
+	Password   string `json:"bot-password"`
 	DB         DB     `json:"db"`
 }
 
@@ -70,7 +70,7 @@ func main() {
 
 	fmt.Printf("Got homeserver: %s\n", config.Homeserver)
 
-	bot, err := matrixbot.NewMatrixBot(config.Username, config.Auth_token, config.Homeserver, config.Botname)
+	bot, err := matrixbot.NewMatrixBot(config.Username, config.Password, config.Homeserver, config.Botname)
 
 	if err != nil {
 		fmt.Println("Couldn't initiate a bot:", err)

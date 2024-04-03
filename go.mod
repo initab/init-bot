@@ -1,6 +1,6 @@
 module init-bot
 
-go 1.22.1
+go 1.21.7
 
 require (
 	github.com/mattn/go-sqlite3 v1.14.22
@@ -11,8 +11,11 @@ require (
 )
 
 require (
+	github.com/hashicorp/errwrap v1.1.0 // indirect
+	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.19 // indirect
+	github.com/posener/complete v1.2.3 // indirect
 	github.com/tidwall/gjson v1.17.1 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect

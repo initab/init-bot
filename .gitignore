@@ -1,3 +1,4 @@
 *.sqllight
 init-bot*
 config.json
+builds/*
