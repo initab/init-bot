@@ -15,32 +15,34 @@ type AIQuery struct {
 	Stream bool   `json:"stream"`
 }
 
-func (q *AIQuery) MakePost() io.Reader {
+func (q *AIQuery) ToIOReader() io.Reader {
 	jsonBody, _ := json.Marshal(q)
 	requestBody := bytes.NewBuffer(jsonBody)
 
 	return requestBody
 }
 
-func NewQuery(options ...Option) AIQuery {
+func NewQuery(options ...Option) *AIQuery {
 	q := AIQuery{}
+	return &q
+}
+
+func (q *AIQuery) WithModel(model string) *AIQuery {
+	q.Model = model
 	return q
 }
 
-func (q *AIQuery) WithModel(model string) {
-	q.Model = model
-
-}
-
-func (q *AIQuery) WithPrompt(prompt string) {
+func (q *AIQuery) WithPrompt(prompt string) *AIQuery {
 	q.Prompt = prompt
-
+	return q
 }
 
-func (q *AIQuery) WithSystem(system string) {
+func (q *AIQuery) WithSystem(system string) *AIQuery {
 	q.System = system
+	return q
 }
 
-func (q *AIQuery) WithStream(stream bool) {
+func (q *AIQuery) WithStream(stream bool) *AIQuery {
 	q.Stream = stream
+	return q
 }

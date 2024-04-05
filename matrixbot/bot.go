@@ -3,22 +3,24 @@ package matrixbot
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/dbutil"
 	"go.mau.fi/util/exzerolog"
+	"init-bot/types"
 	"io"
 	"net/http"
 	"os"
 	"regexp"
-	"slices"
-	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/crypto/cryptohelper"
-	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -33,6 +35,7 @@ type MatrixBot struct {
 	Context      context.Context
 	CancelFunc   context.CancelFunc
 	CryptoHelper *cryptohelper.CryptoHelper
+	Log          zerolog.Logger
 }
 
 // CommandHandler struct to hold a pattern/command associated with the
@@ -52,70 +55,12 @@ type CommandHandler struct {
 	Help string
 }
 
-// sendMessage is the internal method to call when the bot is ready to send a message to a room in Matrix
-// Needs a Context, the RoomID to send the message to, and a String representation of the message to send
-func (bot *MatrixBot) sendMessage(ctx context.Context, room id.RoomID, message string) {
-	content := event.MessageEventContent{
-		MsgType: event.MsgNotice,
-		Body:    message,
-	}
-	_, err := bot.Client.SendMessageEvent(ctx, room, event.EventMessage, content)
-	if err != nil {
-		bot.Client.Log.Error().Err(err).Msg("Error sending Message to Matrix!")
-	}
-}
-
-// RegisterCommand allows to register a command to a handling function
-func (bot *MatrixBot) RegisterCommand(pattern string, minpower int, help string, handler func(ctx context.Context, message string, room id.RoomID, sender id.UserID)) {
-	mbch := CommandHandler{
-		Pattern:  pattern,
-		MinPower: minpower,
-		Handler:  handler,
-		Help:     help,
-	}
-	bot.Client.Log.Debug().
-		Msgf("Registered command: %s [%v]", mbch.Pattern, mbch.MinPower)
-	bot.Handlers = append(bot.Handlers, mbch)
-}
-
-func (bot *MatrixBot) handleCommands(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
-
-	//Don't do anything if the sender is the bot itself
-	//TODO edge-case: bot has the same name as a user but on a different server
-	if strings.Contains(sender.String(), bot.matrixUser) {
-		bot.Client.Log.Debug().Msg("Bots own message, ignore")
-		return
-	}
-
-	handled := false
-	for _, v := range bot.Handlers {
-		r, _ := regexp.Compile(v.Pattern)
-		if r.MatchString(message) {
-			v.Handler(ctx, message, room, sender)
-			handled = true
-		}
-		if !handled {
-			bot.Client.Log.Info().Msgf("'%s' is not a recognized command", v.Pattern)
-		}
-	}
-}
-
-// Sync syncs the matrix events
-func (bot *MatrixBot) Sync() {
-	if err := bot.Client.Sync(); err != nil {
-		log := zerolog.New(zerolog.NewConsoleWriter(func(w *zerolog.ConsoleWriter) {
-			w.Out = os.Stdout
-			w.TimeFormat = time.Stamp
-		})).With().Timestamp().Logger()
-		log.Warn().
-			Msgf("Sync() returned %s", err)
-	}
-}
+var Contexts map[id.RoomID]string
 
 // NewMatrixBot creates a new bot form user credentials
-func NewMatrixBot(user string, pass string, host string, name string) (*MatrixBot, error) {
+func NewMatrixBot(config types.Config) (*MatrixBot, error) {
 
-	cli, err := mautrix.NewClient(host, "", "")
+	cli, err := mautrix.NewClient(config.Homeserver, "", "")
 	if err != nil {
 		panic(err)
 	}
@@ -129,91 +74,52 @@ func NewMatrixBot(user string, pass string, host string, name string) (*MatrixBo
 	cli.Log = log
 
 	bot := &MatrixBot{
-		matrixPass: pass,
-		matrixUser: user,
+		matrixPass: config.Password,
+		matrixUser: config.Username,
 		Client:     cli,
-		Name:       name,
+		Name:       config.Botname,
+		Log:        log,
 	}
 
 	syncCtx, cancelSync := context.WithCancel(context.Background())
 	bot.Context = syncCtx
 	bot.CancelFunc = cancelSync
 
-	syncer := cli.Syncer.(*mautrix.DefaultSyncer)
+	// Setup event handling when bot syncs and gets certain types of events such as Room Invites and Messages
+	_, err = SetupSyncer(bot)
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Problem setting up Syncer and Event handlers")
+	}
 
-	//Handle messages send to the channel
-	syncer.OnEventType(event.EventMessage, func(ctx context.Context, ev *event.Event) {
-		messageEvent := ev.Content.AsMessage()
-
-		if messageEvent.MsgType == event.MsgNotice {
-			log.Debug().Msg("Notice, do nothing")
-			return
-		}
-
-		botUser := bot.Client.UserID
-
-		if messageEvent.Mentions.UserIDs != nil && slices.Contains(messageEvent.Mentions.UserIDs, botUser) {
-			log.Debug().
-				Msgf("%s said \"%s\" in room %s", ev.Sender, messageEvent.Body, ev.RoomID)
-			if messageEvent.Body == bot.Name+" help" {
-				bot.handleCommands(bot.Context, messageEvent.Body, ev.RoomID, ev.Sender)
-			} else {
-				bot.handleCommands(bot.Context, "query "+messageEvent.Body, ev.RoomID, ev.Sender)
-			}
-
-		} else {
-			log.Debug().Msg("Message not for bot")
-		}
-
-	})
-
-	//Handle member events (kick, invite)
-	syncer.OnEventType(event.StateMember, func(ctx context.Context, ev *event.Event) {
-		eventMember := ev.Content.AsMember()
-		log.Debug().
-			Msgf("%s changed bot membership status in %s", ev.Sender, ev.RoomID)
-		if eventMember.Membership.IsInviteOrJoin() {
-			log.Debug().
-				Msgf("Joining Room %s", ev.RoomID)
-			if resp, err := cli.JoinRoom(ctx, ev.RoomID.String(), "", nil); err != nil {
-				log.Fatal().
-					Str("error", err.Error()).
-					Msg("Problem joining room")
-			} else {
-				log.Debug().
-					Msgf("Joined room %s", resp.RoomID)
-			}
-		} else if eventMember.Membership.IsLeaveOrBan() {
-			log.Debug().
-				Msgf("Kicked from room %S", ev.RoomID)
-			log.Info().
-				Msgf("Kicked from %s for reason: %s", ev.RoomID, eventMember.Reason)
-		}
-	})
-
-	syncer.OnEventType(event.StatePowerLevels, func(ctx context.Context, ev *event.Event) {
-		log.Debug().
-			Msg("Got powerlevel event")
-	})
-
-	cryptoHelper, err := cryptohelper.NewCryptoHelper(cli, []byte("meow"), "./bot_crypto_db.sqllight")
+	database, err := dbutil.NewWithDialect(fmt.Sprintf("postgres://%s:%s@%s:%s/%s", config.DB.User, config.DB.Password, config.DB.Host, config.DB.Port, config.DB.DBName), "pgx")
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Error connecting to Database")
+		syscall.Exit(2)
+	}
+	cryptoHelper, err := cryptohelper.NewCryptoHelper(cli, []byte("voff"), database)
 	if err != nil {
 		panic(err)
 	}
 
 	bot.CryptoHelper = cryptoHelper
 
-	log.Debug().Msgf("User: %s", user)
-	log.Debug().Msgf("Password: %s", pass)
+	log.Debug().Msgf("Logging in as user: %s", config.Username)
 
 	cryptoHelper.LoginAs = &mautrix.ReqLogin{
 		Type:       mautrix.AuthTypePassword,
-		Identifier: mautrix.UserIdentifier{Type: mautrix.IdentifierTypeUser, User: user},
-		Password:   pass,
+		Identifier: mautrix.UserIdentifier{Type: mautrix.IdentifierTypeUser, User: config.Username},
+		Password:   config.Password,
 	}
 
 	err = cryptoHelper.Init(syncCtx)
 	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Error logging in and starting Sync")
 		panic(err)
 	}
 	// Set the client crypto helper in order to automatically encrypt outgoing messages
@@ -224,64 +130,167 @@ func NewMatrixBot(user string, pass string, host string, name string) (*MatrixBo
 
 	// Register the commands this bot should handle
 	bot.RegisterCommand("help", 0, "Display this help", bot.handleCommandHelp)
-	bot.RegisterCommand("^query", 0, "Query the AI", bot.QueryAI)
+	bot.RegisterCommand("", 0, "@init-bot with only the word 'help' to get help text. Type anything else to ask the AI", bot.handleQueryAI)
 
 	return bot, nil
 }
 
-// Displays help text on how to handle the bot
+// RegisterCommand allows to register a command to a handling function
+func (bot *MatrixBot) RegisterCommand(pattern string, minpower int, help string, handler func(ctx context.Context, message string, room id.RoomID, sender id.UserID)) {
+	mbch := CommandHandler{
+		Pattern:  pattern,
+		MinPower: minpower,
+		Handler:  handler,
+		Help:     help,
+	}
+	bot.Log.Debug().
+		Msgf("Registered command: %s [%v]", mbch.Pattern, mbch.MinPower)
+	bot.Handlers = append(bot.Handlers, mbch)
+}
+
+// handleCommandHelp is the function that gets invoked when a message for the Bot is found. It then goes through the commands and tries to match the message with a command pattern
+func (bot *MatrixBot) handleCommands(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
+	//Don't do anything if the sender is the bot itself
+	if strings.Contains(sender.String(), bot.matrixUser) {
+		bot.Log.Debug().Msg("Bots own message, ignore")
+		return
+	}
+
+	handled := false
+	var queryIndex int
+	for k, v := range bot.Handlers {
+		if v.Pattern == "" {
+			queryIndex = k
+			continue
+		}
+		r, _ := regexp.Compile(v.Pattern)
+		if r.MatchString(message) {
+			v.Handler(ctx, message, room, sender)
+			handled = true
+		}
+
+	}
+	if !handled {
+		bot.Log.Debug().Msg("Could not find a pattern to handle, treat this as AIQuery")
+		bot.Handlers[queryIndex].Handler(ctx, message, room, sender)
+	}
+}
+
+// HandleCommandHelp Displays help text on how to handle the bot
 func (bot *MatrixBot) handleCommandHelp(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
 	//TODO make this a markdown table?
 	if len(message) > 0 {
-		bot.Client.Log.Info().Msg(message)
+		bot.Log.Info().Msg(message)
 	}
 	helpMsg := `The following commands are avaitible for this bot:
 
-Command			Power required		Explanation
-----------------------------------------------------------------`
+Command					Explanation
+------------------------------------`
 
 	for _, v := range bot.Handlers {
-		helpMsg = helpMsg + "\n!" + v.Pattern + "\t\t\t[" + strconv.Itoa(v.MinPower) + "]\t\t\t\t\t" + v.Help
+		helpMsg = helpMsg + "\n@init-bot " + v.Pattern + "\t\t\t\t\t" + v.Help
 	}
 
-	bot.sendMessage(ctx, room, helpMsg)
+	_, err := bot.Client.SendNotice(ctx, room, helpMsg)
+	if err != nil {
+
+	}
 }
 
-func (bot *MatrixBot) QueryAI(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
-	//TODO acrually query an AI somewhere
-	//for now echo the message back
-
+// handleQueryAI is the function to send queries to the associated AI and return the answer to the user
+func (bot *MatrixBot) handleQueryAI(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
 	//Prepare prompt, model and if exist system prompt
 	promptText := strings.ReplaceAll(strings.ReplaceAll(strings.TrimPrefix(message, "query "), bot.Name, ""), "  ", " ")
-	rawQuery := NewQuery()
-	rawQuery.WithModel("llama2")
-	rawQuery.WithPrompt(promptText)
-	rawQuery.WithStream(false)
+	rawQuery := NewQuery().
+		WithModel("llama2").
+		WithPrompt(promptText).
+		WithStream(false)
 
-	// Convert AIQuery to a io.REader that http.Post can handle
-	requestBody := rawQuery.MakePost()
+	// Convert AIQuery to an io.Reader that http.Post can handle
+	requestBody := rawQuery.ToIOReader()
+
+	// Toogle the bot to be typing
+	c := make(chan bool)
+	go func(c chan bool, bot *MatrixBot) {
+		for {
+			select {
+			case <-c:
+				return
+			default:
+				bot.Log.Debug().Msg("Sending typing again")
+				bot.toggleTyping(ctx, room, true)
+				time.Sleep(15 * time.Second)
+			}
+		}
+	}(c, bot)
 
 	// Make the request
-	resp, err := http.Post("http://localhost:11434/api/generate", "application/json", requestBody)
+	client := http.Client{
+		Timeout: 3600 * time.Second,
+	}
+	bot.Log.Debug().Msg("Sending question to AI")
+	resp, err := client.Post("http://localhost:11434/api/generate", "application/json", requestBody)
 	if err != nil {
-		bot.Client.Log.Error().Err(err).Msg("Error querying AI")
+		c <- true
+		bot.toggleTyping(ctx, room, false)
+		bot.Log.Error().Err(err).Msg("Error querying AI")
 	}
 
 	// We should now have the answer from the bot. Defer closing of the connection until we've read the data
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			bot.Log.Error().
+				Err(err).
+				Msg("Problem closing connection to AI")
+		}
+	}(resp.Body)
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		bot.Client.Log.Error().Err(err).Msg("Error reading answer from AI")
+		c <- true
+		bot.toggleTyping(ctx, room, false)
+		bot.Log.Error().Err(err).Msg("Error reading answer from AI")
 	}
 
 	var fullResponse map[string]interface{}
 	err = json.Unmarshal(body, &fullResponse)
 	if err != nil {
-		bot.Client.Log.Error().Err(err).Msg("Can't unmarshal JSON response from AI")
+		c <- true
+		bot.toggleTyping(ctx, room, false)
+		bot.Log.Error().Err(err).Msg("Can't unmarshal JSON response from AI")
 	}
 
 	response := fullResponse["response"]
+	Contexts[room] = fullResponse["context"].(string)
 
+	// Toggle typing to false and then send reply
+	c <- true
+	bot.toggleTyping(ctx, room, false)
+	bot.Log.Debug().Msg("About to send AI answer")
 	// We have the data, formulate a reply
-	bot.sendMessage(ctx, room, response.(string))
+	_, err = bot.Client.SendNotice(ctx, room, response.(string))
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Couldn't send response back to user")
+	}
+}
+
+// Simple function to toggle the "... is typing" state
+func (bot *MatrixBot) toggleTyping(ctx context.Context, room id.RoomID, isTyping bool) {
+	_, err := bot.Client.UserTyping(ctx, room, isTyping, 15*time.Second)
+	if err != nil {
+		bot.Log.Error().Err(err).Msg("Error setting typing status")
+	}
+}
+
+// Sync syncs the matrix events
+func (bot *MatrixBot) Sync() {
+	err := bot.Client.Sync()
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Sync() returned an error!")
+	}
 }

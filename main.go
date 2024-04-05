@@ -5,57 +5,69 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"init-bot/matrixbot"
-	"io/ioutil"
+	"init-bot/types"
+	"io"
 	"os"
+	"os/signal"
+	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
 )
 
-// Add struct for specific bot rather than generic one
+// InitBot Expand Generic MatrixBot Struct with specific Init Bot SyncGroup
 type InitBot struct {
 	*matrixbot.MatrixBot
+	StopAndSyncGroup sync.WaitGroup
 }
 
-type Config struct {
-	Homeserver string `json:"homeserver"`
-	Botname    string `json:"botname"`
-	Username   string `json:"bot-username"`
-	Password   string `json:"bot-password"`
-	DB         DB     `json:"db"`
-}
-
-type DB struct {
-	Host     string      `json:"host"`
-	Port     json.Number `json:"port"`
-	User     string      `json:"user"`
-	Password string      `json:"password"`
-	DB_name  string      `json:"db_name"`
-	TZ       string      `json:"tz"`
-}
-
-var config Config
+var bot InitBot
+var config types.Config
 
 func main() {
-
 	log := zerolog.New(zerolog.NewConsoleWriter(func(w *zerolog.ConsoleWriter) {
 		w.Out = os.Stdout
 		w.TimeFormat = time.Stamp
 	})).With().Timestamp().Logger()
 
-	jsonFile, err := os.Open("config.json")
+	// Define flags to use
+	configFile := flag.String("config", "./config.json", "Specify path, inculding file, to configuration file. EX: ./config.json")
+	homeServer := flag.String("server", "", "Ovverride Homeserver URL from config file")
+	botName := flag.String("bot-name", "", "Override Bot human friendly name from config")
+	userName := flag.String("username", "", "Override Username for the bot to login in with from config")
+	password := flag.String("password", "", "Override Password for the bot to login in with from config")
+	dbHost := flag.String("db-host", "", "Override Database Host from config")
+	dbPort := flag.Int("db-port", -1, "Override Database Port from config")
+	dbUsername := flag.String("db-username", "", "Override Database Username from config")
+	dbPassword := flag.String("db-password", "", "Override Database Password from config")
+	dbName := flag.String("db-name", "", "Override Database Name from config")
 
+	flag.Parse()
+
+	// Read configuration from file
+	jsonFile, err := os.Open(*configFile)
 	if err != nil {
-		fmt.Println(err)
+		log.Error().
+			Err(err).
+			Msg("Problem opening config JSON file")
+		syscall.Exit(1)
 	}
 
-	defer jsonFile.Close()
+	defer func(jsonFile *os.File) {
+		err := jsonFile.Close()
+		if err != nil {
+			log.Error().
+				Err(err).
+				Msg("Problem closing the config JSON file")
+		}
+	}(jsonFile)
 
-	byteValue, err := ioutil.ReadAll(jsonFile)
-
+	byteValue, err := io.ReadAll(jsonFile)
 	if err != nil {
 		fmt.Println("Coudln't read config.json file")
 		return
@@ -68,45 +80,82 @@ func main() {
 			Msg("Couldn't read JSON in config file")
 	}
 
-	fmt.Printf("Got homeserver: %s\n", config.Homeserver)
+	// If any flags are set, override values from config
+	if *homeServer != "" {
+		config.Homeserver = *homeServer
+	}
+	if *botName != "" {
+		config.Botname = *botName
+	}
+	if *userName != "" {
+		config.Username = *userName
+	}
+	if *password != "" {
+		config.Password = *password
+	}
+	if *dbHost != "" {
+		config.DB.Host = *dbHost
+	}
+	if *dbPort != -1 {
+		config.DB.Port = json.Number(strconv.FormatInt(int64(*dbPort), 10))
+	}
+	if *dbUsername != "" {
+		config.DB.User = *dbUsername
+	}
+	if *dbPassword != "" {
+		config.DB.Password = *dbPassword
+	}
+	if *dbName != "" {
+		config.DB.DBName = *dbName
+	}
 
-	bot, err := matrixbot.NewMatrixBot(config.Username, config.Password, config.Homeserver, config.Botname)
+	log.Info().Msgf("Got homeserver: %s", config.Homeserver)
 
+	// Create the actual bot that will do the heavy lifting
+	matrixBot, err := matrixbot.NewMatrixBot(config)
 	if err != nil {
-		fmt.Println("Couldn't initiate a bot:", err)
+		log.Error().Err(err).
+			Msg("Couldn't initiate a bot")
 		return
 	}
 
-	var syncStopWait sync.WaitGroup
-	syncStopWait.Add(1)
+	bot = InitBot{
+		matrixBot,
+		sync.WaitGroup{},
+	}
+	bot.StopAndSyncGroup.Add(1)
 
 	go func() {
 		err = bot.Client.SyncWithContext(bot.Context)
-		defer syncStopWait.Done()
+		defer bot.StopAndSyncGroup.Done()
 		if err != nil && !errors.Is(err, context.Canceled) {
 			panic(err)
 		}
 	}()
 
-	//initBot := InitBot{bot}
-
-	fmt.Println("About to register commands")
-
-	// Register a command like this
-	//bot.RegisterCommand("!ping", int(0), "Sends a Ping to server", initBot.handlePing)
-
+	// Main loop, keep this alive to keep bot alive
 	for {
-		//Loop forever. If you don't have anything that keeps running, the bot will exit.
+		time.Sleep(1 * time.Minute)
+		bot.Log.Debug().Msg("Alive")
 	}
-	bot.CancelFunc()
-	syncStopWait.Wait()
-	err = bot.CryptoHelper.Close()
-	if err != nil {
-		log.Error().Err(err).Msg("Error closing database")
-	}
+
 }
 
-// Handles functions
-// func (bot *InitBot) handlePing(message, room, sender string) {
-// 	bot.SendTextToRoom(room, "pong!")
-// }
+func init() {
+	c := make(chan os.Signal)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		// Run Cleanup
+		bot.Log.Debug().Msg("Will close down Bot")
+		bot.Context.Done()
+		bot.StopAndSyncGroup.Done()
+		bot.CancelFunc()
+		bot.StopAndSyncGroup.Wait()
+		err := bot.CryptoHelper.Close()
+		if err != nil {
+			bot.Log.Error().Err(err).Msg("Error closing database")
+		}
+		os.Exit(0)
+	}()
+}
