@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
 	"go.mau.fi/util/exzerolog"
@@ -36,6 +38,7 @@ type MatrixBot struct {
 	CancelFunc   context.CancelFunc
 	CryptoHelper *cryptohelper.CryptoHelper
 	Log          zerolog.Logger
+	Database     *pgxpool.Pool
 }
 
 // CommandHandler struct to hold a pattern/command associated with the
@@ -55,24 +58,26 @@ type CommandHandler struct {
 	Help string
 }
 
-var Contexts map[id.RoomID]string
+var Contexts = make(map[id.RoomID][]int)
 
-// NewMatrixBot creates a new bot form user credentials
+// NewMatrixBot creates a new bot form user credentials, loads Context and Database memory into the bot as well
 func NewMatrixBot(config types.Config) (*MatrixBot, error) {
-
-	cli, err := mautrix.NewClient(config.Homeserver, "", "")
-	if err != nil {
-		panic(err)
-	}
-
+	// Setup logging first of all, to be able to log as soon as possible
 	log := zerolog.New(zerolog.NewConsoleWriter(func(w *zerolog.ConsoleWriter) {
 		w.Out = os.Stdout
 		w.TimeFormat = time.Stamp
 	})).With().Timestamp().Logger()
-
 	exzerolog.SetupDefaults(&log)
-	cli.Log = log
 
+	// Initiate a Maytrix Client to work with
+	cli, err := mautrix.NewClient(config.Homeserver, "", "")
+	if err != nil {
+		log.Panic().
+			Err(err).
+			Msg("Can't create a new Mautrix Client. Will quit")
+	}
+	cli.Log = log
+	// Initiate a Matrix bot from the Mautrix Client
 	bot := &MatrixBot{
 		matrixPass: config.Password,
 		matrixUser: config.Username,
@@ -80,7 +85,7 @@ func NewMatrixBot(config types.Config) (*MatrixBot, error) {
 		Name:       config.Botname,
 		Log:        log,
 	}
-
+	// Setup the Context to use (this will be used for the entire bot)
 	syncCtx, cancelSync := context.WithCancel(context.Background())
 	bot.Context = syncCtx
 	bot.CancelFunc = cancelSync
@@ -93,6 +98,7 @@ func NewMatrixBot(config types.Config) (*MatrixBot, error) {
 			Msg("Problem setting up Syncer and Event handlers")
 	}
 
+	// Setup the cryptohelper with a PG backend so we can save crypto keys between restarts
 	database, err := dbutil.NewWithDialect(fmt.Sprintf("postgres://%s:%s@%s:%s/%s", config.DB.User, config.DB.Password, config.DB.Host, config.DB.Port, config.DB.DBName), "pgx")
 	if err != nil {
 		bot.Log.Error().
@@ -107,6 +113,7 @@ func NewMatrixBot(config types.Config) (*MatrixBot, error) {
 
 	bot.CryptoHelper = cryptoHelper
 
+	// Now we are ready to try and login to the Matrix server we should be connected to
 	log.Debug().Msgf("Logging in as user: %s", config.Username)
 
 	cryptoHelper.LoginAs = &mautrix.ReqLogin{
@@ -122,11 +129,67 @@ func NewMatrixBot(config types.Config) (*MatrixBot, error) {
 			Msg("Error logging in and starting Sync")
 		panic(err)
 	}
-	// Set the client crypto helper in order to automatically encrypt outgoing messages
+	// Set the client crypto helper in order to automatically encrypt outgoing/incoming messages
 	cli.Crypto = cryptoHelper
 
 	// Log that we have started up and started listening
 	log.Info().Msg("Now running")
+
+	log.Info().Msg("Setting up DB and Contexts")
+	bot.Database, err = pgxpool.New(syncCtx, fmt.Sprintf("postgres://%s:%s@%s:%s/%s", config.DB.User, config.DB.Password, config.DB.Host, config.DB.Port, config.DB.DBName))
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Error Creating DB Pool")
+	}
+
+	db, err := bot.Database.Acquire(syncCtx)
+	if err != nil {
+		bot.Log.Warn().
+			Err(err).
+			Msg("Error connecting to Database")
+	}
+
+	// Taken from StackOverflow as how to actually check for Real Tables that the user can access
+	rows, _ := db.Query(syncCtx, "SELECT EXISTS (SELECT FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE  n.nspname = $1 AND c.relname = $2 AND c.relkind = 'r');", "public", "Bot-Context")
+	defer rows.Close()
+	bools, err := pgx.CollectRows(rows, pgx.RowTo[bool])
+	rows.Close()
+
+	// If the table doesn't exist in the database we create it. This is where the Bots "memory" will be stored in the form of LLM Tokens that makes up the LLM Context (Different from the Background Context used for all functions in this code)
+	if !bools[0] {
+		_, err := db.Exec(syncCtx, "CREATE TABLE \"Bot-Context\" (room text PRIMARY KEY, context integer ARRAY)")
+		if err != nil {
+			bot.Log.Error().
+				Err(err).
+				Msg("Error creating Bot-Context table")
+		}
+	}
+
+	// Retrieve all rooms from the database
+	rows, err = db.Query(syncCtx, "SELECT * FROM \"Bot-Context\"")
+	if err != nil {
+		bot.Log.Error().Err(err).Msg("Error retrieving rooms from the database")
+	}
+	defer rows.Close()
+	// Iterate over each row and update the Contexts variable
+	for rows.Next() {
+		var roomID string
+		var roomContext []int
+
+		err = rows.Scan(&roomID, &roomContext)
+		if err != nil {
+			bot.Log.Error().
+				Err(err).
+				Msg("Error reading all room contexts from the database")
+		}
+
+		// Use the room column as key to Contexts variable and save the roomContext column
+		Contexts[id.RoomID(roomID)] = roomContext
+	}
+	rows.Close()
+
+	db.Release()
 
 	// Register the commands this bot should handle
 	bot.RegisterCommand("help", 0, "Display this help", bot.handleCommandHelp)
@@ -202,9 +265,14 @@ func (bot *MatrixBot) handleQueryAI(ctx context.Context, message string, room id
 	//Prepare prompt, model and if exist system prompt
 	promptText := strings.ReplaceAll(strings.ReplaceAll(strings.TrimPrefix(message, "query "), bot.Name, ""), "  ", " ")
 	rawQuery := NewQuery().
-		WithModel("llama2").
+		WithModel("mistral").
 		WithPrompt(promptText).
 		WithStream(false)
+
+	queryContext, ok := Contexts[room]
+	if ok {
+		rawQuery.WithContext(queryContext)
+	}
 
 	// Convert AIQuery to an io.Reader that http.Post can handle
 	requestBody := rawQuery.ToIOReader()
@@ -262,7 +330,17 @@ func (bot *MatrixBot) handleQueryAI(ctx context.Context, message string, room id
 	}
 
 	response := fullResponse["response"]
-	Contexts[room] = fullResponse["context"].(string)
+	var botContext []int
+	if rawContext, ok := fullResponse["context"]; ok {
+		for _, v := range rawContext.([]interface{}) {
+			botContext = append(botContext, int(v.(float64)))
+		}
+	}
+	Contexts[room] = botContext
+	err = bot.SaveContext(ctx, room)
+	if err != nil {
+		bot.Log.Warn().Err(err).Msg("Context will not survive restart")
+	}
 
 	// Toggle typing to false and then send reply
 	c <- true
@@ -285,12 +363,55 @@ func (bot *MatrixBot) toggleTyping(ctx context.Context, room id.RoomID, isTyping
 	}
 }
 
-// Sync syncs the matrix events
-func (bot *MatrixBot) Sync() {
-	err := bot.Client.Sync()
+func (bot *MatrixBot) SaveContext(ctx context.Context, room id.RoomID) error {
+	db, err := bot.Database.Acquire(ctx)
 	if err != nil {
 		bot.Log.Error().
 			Err(err).
-			Msg("Sync() returned an error!")
+			Msg("Error acquiring database connection")
+		return err
 	}
+
+	_, err = db.Exec(ctx, "INSERT INTO \"Bot-Context\" VALUES ($1, $2) ON CONFLICT(room) DO UPDATE SET context = EXCLUDED.context", room.String(), Contexts[room])
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Error inserting context to database")
+	}
+
+	db.Release()
+	return nil
+}
+
+func (bot *MatrixBot) LoadContext(ctx context.Context, room id.RoomID) error {
+	db, err := bot.Database.Acquire(ctx)
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Error acquiring database connection")
+		return err
+	}
+	row, err := db.Query(ctx, "SELECT context FROM \"Bot-Context\" WHERE room = $1", room.String())
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Error querying Bot-Context table")
+		return err
+	}
+
+	for row.Next() {
+		var roomContext []int
+		var roomID string
+		err = row.Scan(&roomID, &roomContext)
+		if err != nil {
+			bot.Log.Error().
+				Err(err).
+				Msg("Error scanning row context")
+			return err
+		}
+		Contexts[id.RoomID(roomID)] = roomContext
+	}
+
+	db.Release()
+	return nil
 }

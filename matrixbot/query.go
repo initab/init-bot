@@ -9,10 +9,11 @@ import (
 type Option func(q AIQuery) AIQuery
 
 type AIQuery struct {
-	Model  string `json:"model"`
-	System string `json:"system,omitempty"`
-	Prompt string `json:"prompt"`
-	Stream bool   `json:"stream"`
+	Model   string `json:"model"`
+	System  string `json:"system,omitempty"`
+	Prompt  string `json:"prompt"`
+	Stream  bool   `json:"stream"`
+	Context []int  `json:"context"`
 }
 
 func (q *AIQuery) ToIOReader() io.Reader {
@@ -44,5 +45,10 @@ func (q *AIQuery) WithSystem(system string) *AIQuery {
 
 func (q *AIQuery) WithStream(stream bool) *AIQuery {
 	q.Stream = stream
+	return q
+}
+
+func (q *AIQuery) WithContext(context []int) *AIQuery {
+	q.Context = context
 	return q
 }
