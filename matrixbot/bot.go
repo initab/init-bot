@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	chroma "github.com/amikos-tech/chroma-go"
+	"github.com/amikos-tech/chroma-go/ollama"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
@@ -29,6 +31,7 @@ import (
 // MatrixBot struct to hold the bot and it's methods
 type MatrixBot struct {
 	//Map a repository to matrix rooms
+	Config       types.Config
 	Client       *mautrix.Client
 	matrixPass   string
 	matrixUser   string
@@ -41,8 +44,7 @@ type MatrixBot struct {
 	Database     *pgxpool.Pool
 }
 
-// CommandHandler struct to hold a pattern/command associated with the
-// handling function and the needed minimum power of the user in the room
+// CommandHandler struct to hold information about a command handler.
 type CommandHandler struct {
 
 	//Pattern to initiate the command
@@ -58,9 +60,19 @@ type CommandHandler struct {
 	Help string
 }
 
+// Contexts is a map that stores the context values for each room in the bot.
 var Contexts = make(map[id.RoomID][]int)
 
-// NewMatrixBot creates a new bot form user credentials, loads Context and Database memory into the bot as well
+// NewMatrixBot creates a new MatrixBot instance with the provided configuration.
+// It sets up logging, initializes a Mautrix client, and sets the necessary
+// properties on the bot. It also sets up event handling for syncing and
+// certain types of events. Additionally, it sets up the crypto helper with
+// a PG backend for saving crypto keys. Finally, it logs in to the Matrix server
+// and starts the sync, sets the client crypto helper, and initializes the database
+// and contexts. It registers the commands the bot should handle and returns the
+// initialized bot instance or an error.
+// config: the configuration for the bot
+// returns: the initialized MatrixBot instance or an error
 func NewMatrixBot(config types.Config) (*MatrixBot, error) {
 	// Setup logging first of all, to be able to log as soon as possible
 	log := zerolog.New(zerolog.NewConsoleWriter(func(w *zerolog.ConsoleWriter) {
@@ -191,14 +203,21 @@ func NewMatrixBot(config types.Config) (*MatrixBot, error) {
 
 	db.Release()
 
+	// Set bots Config to use the config provided by the user
+	bot.Config = config
+
 	// Register the commands this bot should handle
 	bot.RegisterCommand("help", 0, "Display this help", bot.handleCommandHelp)
+	bot.RegisterCommand("^search", 0, "Start message with 'search' to search SharePoint documents", bot.handleSearch)
 	bot.RegisterCommand("", 0, "@init-bot with only the word 'help' to get help text. Type anything else to ask the AI", bot.handleQueryAI)
 
 	return bot, nil
 }
 
-// RegisterCommand allows to register a command to a handling function
+// RegisterCommand registers a new command handler with the provided pattern, minimum power level, help message, and handler function.
+// The handler function should have the signature func(ctx context.Context, message string, room id.RoomID, sender id.UserID).
+// It creates a new CommandHandler struct with the provided parameters and appends it to the bot's Handlers slice.
+// It also logs a debug message indicating the registration of the command handler.
 func (bot *MatrixBot) RegisterCommand(pattern string, minpower int, help string, handler func(ctx context.Context, message string, room id.RoomID, sender id.UserID)) {
 	mbch := CommandHandler{
 		Pattern:  pattern,
@@ -211,7 +230,10 @@ func (bot *MatrixBot) RegisterCommand(pattern string, minpower int, help string,
 	bot.Handlers = append(bot.Handlers, mbch)
 }
 
-// handleCommandHelp is the function that gets invoked when a message for the Bot is found. It then goes through the commands and tries to match the message with a command pattern
+// handleCommands handles incoming messages by checking if the sender is the bot itself and ignores the message if true.
+// Then it iterates over the registered command handlers and checks if the message matches the pattern for each handler.
+// If a match is found, the corresponding handler function is called and the handled variable is set to true.
+// If no match is found, it treats the message as an AIQuery and calls the handler function for AIQuery using the queryIndex.
 func (bot *MatrixBot) handleCommands(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
 	//Don't do anything if the sender is the bot itself
 	if strings.Contains(sender.String(), bot.matrixUser) {
@@ -219,6 +241,7 @@ func (bot *MatrixBot) handleCommands(ctx context.Context, message string, room i
 		return
 	}
 
+	bot.Log.Info().Msg("Handling input...")
 	handled := false
 	var queryIndex int
 	for k, v := range bot.Handlers {
@@ -239,7 +262,11 @@ func (bot *MatrixBot) handleCommands(ctx context.Context, message string, room i
 	}
 }
 
-// HandleCommandHelp Displays help text on how to handle the bot
+// handleCommandHelp displays the list of available commands for the bot
+// in a formatted message. It iterates over the registered command handlers
+// and appends their pattern and help message to a help message string.
+//
+// The help message is then sent as a notice to the specified room.
 func (bot *MatrixBot) handleCommandHelp(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
 	//TODO make this a markdown table?
 	if len(message) > 0 {
@@ -260,12 +287,16 @@ Command					Explanation
 	}
 }
 
-// handleQueryAI is the function to send queries to the associated AI and return the answer to the user
+// handleQueryAI handles the processing of a query from a user and sends it to the AI for a response.
+// It prepares the prompt, model, and system prompt (if available),
+// makes the request to the AI API, reads and parses the response,
+// updates the bot's context and saves it to permanent storage,
+// and finally sends the response back to the user.
 func (bot *MatrixBot) handleQueryAI(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
 	//Prepare prompt, model and if exist system prompt
 	promptText := strings.ReplaceAll(strings.ReplaceAll(strings.TrimPrefix(message, "query "), bot.Name, ""), "  ", " ")
 	rawQuery := NewQuery().
-		WithModel("mistral").
+		WithModel(bot.Config.AI.Endpoints["chat"].Model).
 		WithPrompt(promptText).
 		WithStream(false)
 
@@ -277,7 +308,7 @@ func (bot *MatrixBot) handleQueryAI(ctx context.Context, message string, room id
 	// Convert AIQuery to an io.Reader that http.Post can handle
 	requestBody := rawQuery.ToIOReader()
 
-	// Toogle the bot to be typing
+	// Toogle the bot to be typing for 15 seconds periods before sending typing again
 	c := make(chan bool)
 	go func(c chan bool, bot *MatrixBot) {
 		for {
@@ -285,23 +316,25 @@ func (bot *MatrixBot) handleQueryAI(ctx context.Context, message string, room id
 			case <-c:
 				return
 			default:
-				bot.Log.Debug().Msg("Sending typing again")
+				bot.Log.Debug().Msg("Sending typing as at least one room has asked the bot something")
 				bot.toggleTyping(ctx, room, true)
-				time.Sleep(15 * time.Second)
+				time.Sleep(30 * time.Second)
 			}
 		}
 	}(c, bot)
 
-	// Make the request
+	// Make the request to AI API
 	client := http.Client{
 		Timeout: 3600 * time.Second,
 	}
-	bot.Log.Debug().Msg("Sending question to AI")
-	resp, err := client.Post("http://localhost:11434/api/generate", "application/json", requestBody)
+	bot.Log.Info().Msg("Sending question to AI, waiting...")
+	resp, err := client.Post(fmt.Sprintf("%s:%s/%s", bot.Config.AI.Host, bot.Config.AI.Port, bot.Config.AI.Endpoints["chat"].Url), "application/json", requestBody)
 	if err != nil {
 		c <- true
 		bot.toggleTyping(ctx, room, false)
-		bot.Log.Error().Err(err).Msg("Error querying AI")
+		bot.Log.Error().
+			Err(err).
+			Msg("Error querying AI")
 	}
 
 	// We should now have the answer from the bot. Defer closing of the connection until we've read the data
@@ -329,13 +362,16 @@ func (bot *MatrixBot) handleQueryAI(ctx context.Context, message string, room id
 		bot.Log.Error().Err(err).Msg("Can't unmarshal JSON response from AI")
 	}
 
+	bot.Log.Info().Msg("Preparing response")
 	response := fullResponse["response"]
 	var botContext []int
 	if rawContext, ok := fullResponse["context"]; ok {
+		bot.Log.Debug().Msg("Retrieving Context from AI")
 		for _, v := range rawContext.([]interface{}) {
 			botContext = append(botContext, int(v.(float64)))
 		}
 	}
+	bot.Log.Debug().Msg("Updating Init Bot Context and saving to permanent storage")
 	Contexts[room] = botContext
 	err = bot.SaveContext(ctx, room)
 	if err != nil {
@@ -353,16 +389,65 @@ func (bot *MatrixBot) handleQueryAI(ctx context.Context, message string, room id
 			Err(err).
 			Msg("Couldn't send response back to user")
 	}
+	bot.Log.Info().Msg("Sent response back to user")
+}
+
+// handleSearch performs a search using Ollama and ChromaDB
+// It prepares the prompt text, Ollama and ChromaDB clients, and retrieves the collection from ChromaDB.
+// Then it queries ChromaDB with the prompt text and sends the response to handleQueryAI function.
+func (bot *MatrixBot) handleSearch(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
+	//Prepare prompt, model and if exist system prompt
+	promptText := strings.ReplaceAll(strings.ReplaceAll(strings.TrimPrefix(message, "search "), bot.Name, ""), "  ", " ")
+
+	url := ollama.WithBaseURL(bot.Config.AI.Host + ":" + bot.Config.AI.Port.String())
+	model := ollama.WithModel("mxbai-embed-large")
+
+	ollamaClient, err := ollama.NewOllamaEmbeddingFunction(url, model)
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Couldn't create Ollama embedding function")
+	}
+
+	client, err := chroma.NewClient("http://localhost:8000")
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Couldn't create ChromaDB client")
+	}
+
+	sharePointCollection, err := client.GetCollection(ctx, "init-sharepoint", ollamaClient)
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Couldn't retrieve the Collection from ChromaDB")
+	}
+
+	qresp, err := sharePointCollection.Query(ctx, []string{promptText}, 1, nil, nil, nil)
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Couldn't query ChromaDB")
+	}
+
+	promptAI := fmt.Sprintf("Använda denna information: \"%s\". För att besvara denna fråga: \"%s\"", qresp.Documents[0][0], promptText)
+
+	bot.handleQueryAI(ctx, promptAI, room, sender)
+
 }
 
 // Simple function to toggle the "... is typing" state
 func (bot *MatrixBot) toggleTyping(ctx context.Context, room id.RoomID, isTyping bool) {
-	_, err := bot.Client.UserTyping(ctx, room, isTyping, 15*time.Second)
+	_, err := bot.Client.UserTyping(ctx, room, isTyping, 60*time.Second)
 	if err != nil {
 		bot.Log.Error().Err(err).Msg("Error setting typing status")
 	}
 }
 
+// SaveContext saves the context for a given room in the "Bot-Context" table of the database.
+// If the room already has a context, it updates the existing context.
+// Returns an error if there was a problem acquiring the database connection or inserting the context.
+// Acquires a database connection, inserts or updates the context in the database, and releases the connection.
 func (bot *MatrixBot) SaveContext(ctx context.Context, room id.RoomID) error {
 	db, err := bot.Database.Acquire(ctx)
 	if err != nil {
@@ -383,6 +468,11 @@ func (bot *MatrixBot) SaveContext(ctx context.Context, room id.RoomID) error {
 	return nil
 }
 
+// LoadContext loads the context for a given room from the "Bot-Context" table
+// of the database. It acquires a database connection, queries the context from
+// the table, and then stores the context in the Contexts map.
+// Returns an error if there was a problem acquiring the database connection,
+// querying the table, or scanning the row.
 func (bot *MatrixBot) LoadContext(ctx context.Context, room id.RoomID) error {
 	db, err := bot.Database.Acquire(ctx)
 	if err != nil {
