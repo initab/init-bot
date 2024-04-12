@@ -10,9 +10,11 @@ import (
 	"init-bot/matrixbot"
 	"init-bot/types"
 	"io"
+	"maunium.net/go/mautrix/event"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -43,6 +45,9 @@ func main() {
 		w.Out = os.Stdout
 		w.TimeFormat = time.Stamp
 	})).With().Timestamp().Logger()
+
+	cQuit := make(chan os.Signal)
+	signal.Notify(cQuit, os.Interrupt, syscall.SIGTERM)
 
 	// Define flags to use
 	configFile := flag.String("config", "./config.json", "Specify path, inculding file, to configuration file. EX: ./config.json")
@@ -123,7 +128,7 @@ func main() {
 		config.LogLevel = *logLevel
 	}
 
-	level, err := zerolog.ParseLevel(config.LogLevel)
+	level, err := zerolog.ParseLevel(strings.ToLower(config.LogLevel))
 	if err != nil {
 		log.Error().Err(err).Msg("Couldn't parse log level")
 	} else {
@@ -131,9 +136,9 @@ func main() {
 	}
 
 	log.Info().Msgf("Got homeserver: %s", config.Homeserver)
-
+	log.Debug().Msg("Setting up Bot")
 	// Create the actual bot that will do the heavy lifting
-	matrixBot, err := matrixbot.NewMatrixBot(config)
+	matrixBot, err := matrixbot.NewMatrixBot(config, &log)
 	if err != nil {
 		log.Error().Err(err).
 			Msg("Couldn't initiate a bot")
@@ -147,47 +152,75 @@ func main() {
 	bot.StopAndSyncGroup.Add(1)
 
 	go func() {
+		bot.Log.Info().Msg("Start Sync")
 		err = bot.Client.SyncWithContext(bot.Context)
 		defer bot.StopAndSyncGroup.Done()
 		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Error().Msg("This error shouldn't happen")
-			panic(err)
+			log.Error().
+				Err(err).
+				Msg("There was an error while running Sync")
+		}
+		if err != nil && errors.Is(err, context.Canceled) {
+			log.Info().Err(err).Msg("Context was cancelled")
 		}
 	}()
 
-	// Main loop, keep this alive to keep bot alive
-	for {
-		time.Sleep(1 * time.Minute)
-		bot.Log.Debug().Msg("Alive")
+	bot.Log.Info().Msgf("Setting %s online and sending hello", bot.Name)
+	err = bot.Client.SetPresence(bot.Context, event.PresenceOnline)
+	if err != nil {
+		bot.Log.Warn().Msg("Couldn't set 'Online' presence")
 	}
+	respRooms, err := bot.Client.JoinedRooms(bot.Context)
+	if err != nil {
+		bot.Log.Info().Msg("Couldn't get joined rooms. Won't say goodbye")
+	} else {
+		for _, v := range respRooms.JoinedRooms {
+			_, innerErr := bot.Client.SendNotice(bot.Context, v, "I'm Online again. Hello!")
+			if innerErr != nil {
+				bot.Log.Info().Err(err).Any("room", v).Msgf("Couldn't say hello in room %s", v)
+			}
+		}
+	}
+
+	// Wait for the signal to quit the bot
+	<-cQuit
+	stopBot()
 }
 
-// init sets up an interrupt signal handler to perform cleanup when the application receives an interrupt signal
-// The cleanup includes canceling the context, waiting for the cancellation to complete,
-// closing the crypto database, closing the database connection, and exiting the application.
-//
-// The function creates a channel to receive interrupt signals from the operating system.
-// It registers the channel to receive interrupt signals and termination signals.
-//
-// The function starts a goroutine to wait for an interrupt signal.
-// When an interrupt signal is received, the function logs a debug message, cancels the bot context,
-// waits for the cancellation to complete, waits for the bot's stop and sync group to finish,
-// closes the crypto database, closes the database connection, and exits the application.
-func init() {
-	c := make(chan os.Signal)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-c
-		// Run Cleanup
-		bot.Log.Debug().Msg("Will close down Bot")
-		bot.CancelFunc()
-		<-bot.Context.Done()
-		bot.StopAndSyncGroup.Wait()
-		err := bot.CryptoHelper.Close()
-		if err != nil {
-			bot.Log.Error().Err(err).Msg("Error closing crypto db")
+// stopBot stops the bot and performs cleanup tasks before exiting the application.
+func stopBot() {
+	// Run Cleanup
+	bot.Log.Info().Msg("Will close down Bot")
+	respRooms, err := bot.Client.JoinedRooms(bot.Context)
+	if err != nil {
+		bot.Log.Info().Msg("Couldn't get joined rooms. Won't say goodbye")
+	} else {
+		for _, v := range respRooms.JoinedRooms {
+			_, innerErr := bot.Client.SendNotice(bot.Context, v, "Going offline. Bye!")
+			if innerErr != nil {
+				bot.Log.Info().Err(err).Any("room", v).Msgf("Couldn't say goodbye in room %s", v)
+			}
 		}
-		bot.Database.Close()
-		os.Exit(0)
-	}()
+	}
+	err = bot.Client.SetPresence(bot.Context, event.PresenceOffline)
+	if err != nil {
+		bot.Log.Warn().Msg("Couldn't set 'Offline' presence")
+	}
+	bot.CancelRunningHandlers(bot.Context)
+	bot.Log.Debug().Msg("Stopping sync")
+	bot.Client.StopSync()
+	bot.Log.Debug().Msg("Logging out")
+	bot.Log.Debug().Msg("Waiting for sync group to finish")
+	bot.StopAndSyncGroup.Wait()
+	bot.Log.Debug().Msg("Will cancel Go Context")
+	bot.CancelFunc()
+	bot.Log.Debug().Msg("Will close down Crypto Helper DB")
+	err = bot.CryptoHelper.Close()
+	if err != nil {
+		bot.Log.Error().Err(err).Msg("Error closing crypto db")
+	}
+	bot.Log.Debug().Msg("Will close PG DB connection")
+	bot.Database.Close()
+	bot.Log.Info().Msg("Bot closed")
+	os.Exit(0)
 }

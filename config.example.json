@@ -1,0 +1,32 @@
+{
+    "homeserver": "",
+    "botname": "Bot Name",
+    "bot-username": "",
+    "bot-password": "",
+    "log-level": "debug",
+    "db": {
+        "host": "localhost",
+        "port": 5432,
+        "user": "postgres",
+        "password": "",
+        "db_name": "bot"
+    },
+    "ai": {
+        "host": "http://localhost",
+        "port": 11434,
+        "endpoints": {
+            "chat": {
+                "url": "api/generate",
+                "model": "llama2"
+            },
+            "instruct": {
+                "url": "api/generate",
+                "model": "llama2"
+            },
+            "image": {
+                "url": "api/generate",
+                "model": "stable-diffusion"
+            }
+        }
+    }
+}

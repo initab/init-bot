@@ -10,11 +10,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
-	"go.mau.fi/util/exzerolog"
 	"init-bot/types"
 	"io"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/format"
 	"net/http"
-	"os"
 	"regexp"
 	"strings"
 	"syscall"
@@ -60,6 +60,8 @@ type CommandHandler struct {
 	Help string
 }
 
+var runningCmds = make(map[context.Context]*context.CancelFunc)
+
 // Contexts is a map that stores the context values for each room in the bot.
 var Contexts = make(map[id.RoomID][]int)
 
@@ -73,13 +75,8 @@ var Contexts = make(map[id.RoomID][]int)
 // initialized bot instance or an error.
 // config: the configuration for the bot
 // returns: the initialized MatrixBot instance or an error
-func NewMatrixBot(config types.Config) (*MatrixBot, error) {
+func NewMatrixBot(config types.Config, log *zerolog.Logger) (*MatrixBot, error) {
 	// Setup logging first of all, to be able to log as soon as possible
-	log := zerolog.New(zerolog.NewConsoleWriter(func(w *zerolog.ConsoleWriter) {
-		w.Out = os.Stdout
-		w.TimeFormat = time.Stamp
-	})).With().Timestamp().Logger()
-	exzerolog.SetupDefaults(&log)
 
 	// Initiate a Maytrix Client to work with
 	cli, err := mautrix.NewClient(config.Homeserver, "", "")
@@ -88,21 +85,21 @@ func NewMatrixBot(config types.Config) (*MatrixBot, error) {
 			Err(err).
 			Msg("Can't create a new Mautrix Client. Will quit")
 	}
-	cli.Log = log
+	cli.Log = *log
 	// Initiate a Matrix bot from the Mautrix Client
 	bot := &MatrixBot{
 		matrixPass: config.Password,
 		matrixUser: config.Username,
 		Client:     cli,
 		Name:       config.Botname,
-		Log:        log,
+		Log:        log.With().Str("component", config.Botname).Logger(),
 	}
-	// Setup the Context to use (this will be used for the entire bot)
+	// Set up the Context to use (this will be used for the entire bot)
 	syncCtx, cancelSync := context.WithCancel(context.Background())
 	bot.Context = syncCtx
 	bot.CancelFunc = cancelSync
 
-	// Setup event handling when bot syncs and gets certain types of events such as Room Invites and Messages
+	// Set up event handling when bot syncs and gets certain types of events such as Room Invites and Messages
 	_, err = SetupSyncer(bot)
 	if err != nil {
 		bot.Log.Error().
@@ -110,7 +107,7 @@ func NewMatrixBot(config types.Config) (*MatrixBot, error) {
 			Msg("Problem setting up Syncer and Event handlers")
 	}
 
-	// Setup the cryptohelper with a PG backend so we can save crypto keys between restarts
+	// Set up the cryptohelper with a PG backend so we can save crypto keys between restarts
 	database, err := dbutil.NewWithDialect(fmt.Sprintf("postgres://%s:%s@%s:%s/%s", config.DB.User, config.DB.Password, config.DB.Host, config.DB.Port, config.DB.DBName), "pgx")
 	if err != nil {
 		bot.Log.Error().
@@ -122,7 +119,6 @@ func NewMatrixBot(config types.Config) (*MatrixBot, error) {
 	if err != nil {
 		panic(err)
 	}
-
 	bot.CryptoHelper = cryptoHelper
 
 	// Now we are ready to try and login to the Matrix server we should be connected to
@@ -207,9 +203,9 @@ func NewMatrixBot(config types.Config) (*MatrixBot, error) {
 	bot.Config = config
 
 	// Register the commands this bot should handle
-	bot.RegisterCommand("help", 0, "Display this help", bot.handleCommandHelp)
+	bot.RegisterCommand("^help", 0, "Display this help", bot.handleCommandHelp)
 	bot.RegisterCommand("^search", 0, "Start message with 'search' to search SharePoint documents", bot.handleSearch)
-	bot.RegisterCommand("", 0, "@init-bot with only the word 'help' to get help text. Type anything else to ask the AI", bot.handleQueryAI)
+	bot.RegisterCommand("", 0, "Default action is to Query the AI", bot.handleQueryAI)
 
 	return bot, nil
 }
@@ -242,6 +238,12 @@ func (bot *MatrixBot) handleCommands(ctx context.Context, message string, room i
 	}
 
 	bot.Log.Info().Msg("Handling input...")
+	// Trim bot name, double spaces, and convert string to all lower case before trying to match with pattern of command
+	matchMessage := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(message, bot.Name+" ", ""), bot.Name, ""), "  ", " "))
+	bot.Log.Debug().
+		Str("message", matchMessage).
+		Str("user", sender.String()).
+		Msg("Message from user")
 	handled := false
 	var queryIndex int
 	for k, v := range bot.Handlers {
@@ -250,15 +252,19 @@ func (bot *MatrixBot) handleCommands(ctx context.Context, message string, room i
 			continue
 		}
 		r, _ := regexp.Compile(v.Pattern)
-		if r.MatchString(message) {
-			v.Handler(ctx, message, room, sender)
+		if r.MatchString(matchMessage) {
 			handled = true
+			cmdContext, cmdCancelFunc := context.WithDeadline(ctx, time.Now().Local().Add(20*time.Minute))
+			runningCmds[cmdContext] = &cmdCancelFunc
+			go v.Handler(cmdContext, message, room, sender)
 		}
 
 	}
 	if !handled {
 		bot.Log.Debug().Msg("Could not find a pattern to handle, treat this as AIQuery")
-		bot.Handlers[queryIndex].Handler(ctx, message, room, sender)
+		cmdContext, cmdCancelFunc := context.WithDeadline(ctx, time.Now().Local().Add(20*time.Minute))
+		runningCmds[cmdContext] = &cmdCancelFunc
+		go bot.Handlers[queryIndex].Handler(cmdContext, message, room, sender)
 	}
 }
 
@@ -268,23 +274,31 @@ func (bot *MatrixBot) handleCommands(ctx context.Context, message string, room i
 //
 // The help message is then sent as a notice to the specified room.
 func (bot *MatrixBot) handleCommandHelp(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
-	//TODO make this a markdown table?
 	if len(message) > 0 {
 		bot.Log.Info().Msg(message)
 	}
-	helpMsg := `The following commands are avaitible for this bot:
+	helpMsg := `# Init Bot Help
+The bot will only react when you @ the bot. Commands do not take @Init-Bot into account when evaluating for commands. All commands are case insensitive
 
-Command					Explanation
-------------------------------------`
+The following commands are avaitible for this bot:
+
+|Command|Explanation|
+|---|---|`
 
 	for _, v := range bot.Handlers {
-		helpMsg = helpMsg + "\n@init-bot " + v.Pattern + "\t\t\t\t\t" + v.Help
+		helpMsg = helpMsg + "\n|@init-bot " + v.Pattern + "|" + v.Help + "|"
 	}
 
-	_, err := bot.Client.SendNotice(ctx, room, helpMsg)
+	sendMsg := format.RenderMarkdown(helpMsg, true, true)
+	_, err := bot.sendHTMLNotice(ctx, room, sendMsg.FormattedBody)
 	if err != nil {
-
+		bot.Log.Error().
+			Err(err).
+			Msg("Error sending help message")
 	}
+	ctx.Done()
+	delete(runningCmds, ctx)
+	// (*runningCmds[ctx])() // run cancel function
 }
 
 // handleQueryAI handles the processing of a query from a user and sends it to the AI for a response.
@@ -293,103 +307,26 @@ Command					Explanation
 // updates the bot's context and saves it to permanent storage,
 // and finally sends the response back to the user.
 func (bot *MatrixBot) handleQueryAI(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
-	//Prepare prompt, model and if exist system prompt
-	promptText := strings.ReplaceAll(strings.ReplaceAll(strings.TrimPrefix(message, "query "), bot.Name, ""), "  ", " ")
-	rawQuery := NewQuery().
-		WithModel(bot.Config.AI.Endpoints["chat"].Model).
-		WithPrompt(promptText).
-		WithStream(false)
 
-	queryContext, ok := Contexts[room]
-	if ok {
-		rawQuery.WithContext(queryContext)
-	}
-
-	// Convert AIQuery to an io.Reader that http.Post can handle
-	requestBody := rawQuery.ToIOReader()
-
-	// Toogle the bot to be typing for 15 seconds periods before sending typing again
-	c := make(chan bool)
-	go func(c chan bool, bot *MatrixBot) {
-		for {
-			select {
-			case <-c:
-				return
-			default:
-				bot.Log.Debug().Msg("Sending typing as at least one room has asked the bot something")
-				bot.toggleTyping(ctx, room, true)
-				time.Sleep(30 * time.Second)
-			}
-		}
-	}(c, bot)
-
-	// Make the request to AI API
-	client := http.Client{
-		Timeout: 3600 * time.Second,
-	}
-	bot.Log.Info().Msg("Sending question to AI, waiting...")
-	resp, err := client.Post(fmt.Sprintf("%s:%s/%s", bot.Config.AI.Host, bot.Config.AI.Port, bot.Config.AI.Endpoints["chat"].Url), "application/json", requestBody)
+	response, err := bot.queryAI(ctx, message, room)
 	if err != nil {
-		c <- true
-		bot.toggleTyping(ctx, room, false)
 		bot.Log.Error().
 			Err(err).
-			Msg("Error querying AI")
+			Msg("Couldn't query AI")
+		return
 	}
 
-	// We should now have the answer from the bot. Defer closing of the connection until we've read the data
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			bot.Log.Error().
-				Err(err).
-				Msg("Problem closing connection to AI")
-		}
-	}(resp.Body)
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		c <- true
-		bot.toggleTyping(ctx, room, false)
-		bot.Log.Error().Err(err).Msg("Error reading answer from AI")
-	}
-
-	var fullResponse map[string]interface{}
-	err = json.Unmarshal(body, &fullResponse)
-	if err != nil {
-		c <- true
-		bot.toggleTyping(ctx, room, false)
-		bot.Log.Error().Err(err).Msg("Can't unmarshal JSON response from AI")
-	}
-
-	bot.Log.Info().Msg("Preparing response")
-	response := fullResponse["response"]
-	var botContext []int
-	if rawContext, ok := fullResponse["context"]; ok {
-		bot.Log.Debug().Msg("Retrieving Context from AI")
-		for _, v := range rawContext.([]interface{}) {
-			botContext = append(botContext, int(v.(float64)))
-		}
-	}
-	bot.Log.Debug().Msg("Updating Init Bot Context and saving to permanent storage")
-	Contexts[room] = botContext
-	err = bot.SaveContext(ctx, room)
-	if err != nil {
-		bot.Log.Warn().Err(err).Msg("Context will not survive restart")
-	}
-
-	// Toggle typing to false and then send reply
-	c <- true
-	bot.toggleTyping(ctx, room, false)
-	bot.Log.Debug().Msg("About to send AI answer")
 	// We have the data, formulate a reply
-	_, err = bot.Client.SendNotice(ctx, room, response.(string))
+	_, err = bot.sendHTMLNotice(ctx, room, response["response"].(string))
 	if err != nil {
 		bot.Log.Error().
 			Err(err).
 			Msg("Couldn't send response back to user")
 	}
 	bot.Log.Info().Msg("Sent response back to user")
+	ctx.Done()
+	delete(runningCmds, ctx)
+	// (*runningCmds[ctx])() // run cancel function
 }
 
 // handleSearch performs a search using Ollama and ChromaDB
@@ -430,18 +367,28 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message string, room id.
 			Msg("Couldn't query ChromaDB")
 	}
 
-	promptAI := fmt.Sprintf("Använda denna information: \"%s\". För att besvara denna fråga: \"%s\"", qresp.Documents[0][0], promptText)
+	promptAI := fmt.Sprintf("Använd denna information: \"%s\". För att besvara denna fråga: \"%s\"", qresp.Documents[0][0], promptText)
 
-	bot.handleQueryAI(ctx, promptAI, room, sender)
-
-}
-
-// Simple function to toggle the "... is typing" state
-func (bot *MatrixBot) toggleTyping(ctx context.Context, room id.RoomID, isTyping bool) {
-	_, err := bot.Client.UserTyping(ctx, room, isTyping, 60*time.Second)
+	response, err := bot.queryAI(ctx, promptAI, room)
 	if err != nil {
-		bot.Log.Error().Err(err).Msg("Error setting typing status")
+		bot.Log.Error().Err(err).Msg("Error using Search response in AI query")
 	}
+	reply := response["response"].(string) + `
+
+Från denna länk: ` + strings.Split(strings.Split(qresp.Documents[0][0], "Link: ")[1], "\n")[0]
+	// We have the data, formulate a reply
+	_, err = bot.sendHTMLNotice(ctx, room, reply)
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Couldn't send response back to user")
+	}
+	bot.Log.Info().Msg("Sent response back to user")
+
+	ctx.Done()
+	delete(runningCmds, ctx)
+	// (*runningCmds[ctx])() // run cancel function
+
 }
 
 // SaveContext saves the context for a given room in the "Bot-Context" table of the database.
@@ -504,4 +451,155 @@ func (bot *MatrixBot) LoadContext(ctx context.Context, room id.RoomID) error {
 
 	db.Release()
 	return nil
+}
+
+func (bot *MatrixBot) CancelRunningHandlers(ctx context.Context) {
+	for cmdCtx, cancelFunc := range runningCmds {
+		(*cancelFunc)()
+		delete(runningCmds, cmdCtx)
+	}
+}
+
+// sendHTMLNotice sends an HTML formatted notice message to the specified room.
+// It converts the HTML message to plain text using the format.HTMLToText function.
+// Then it calls the SendMessageEvent method of the bot's Client to send the message.
+// The message event type is set to MsgNotice and the message body and formatted body
+// are set to the plain text and original HTML message, respectively.
+// The message format is set to FormatHTML.
+// If an error occurs while sending the message, it returns nil and the error.
+// Otherwise, it returns the response from SendMessageEvent.
+func (bot *MatrixBot) sendHTMLNotice(ctx context.Context, room id.RoomID, message string) (*mautrix.RespSendEvent, error) {
+	plainMsg := format.HTMLToText(message)
+	resp, err := bot.Client.SendMessageEvent(ctx, room, event.EventMessage, &event.MessageEventContent{
+		MsgType:       event.MsgNotice,
+		Body:          plainMsg,
+		FormattedBody: message,
+		Format:        event.FormatHTML,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// Simple function to toggle the "... is typing" state
+func (bot *MatrixBot) toggleTyping(ctx context.Context, room id.RoomID, isTyping bool) {
+	_, err := bot.Client.UserTyping(ctx, room, isTyping, 60*time.Second)
+	if err != nil {
+		bot.Log.Error().Err(err).Msg("Error setting typing status")
+	}
+}
+
+// queryAI sends a question to the AI API and returns the response as a map[string]interface{}.
+// It prepares the prompt, model, and system prompt (if available) based on the provided message and room.
+// Then, it makes a POST request to the AI API with the constructed query and waits for the response.
+// The response is read, parsed, and returned as a map[string]interface{}.
+// The method also updates the bot's context based on the response, if available, and saves it to permanent storage.
+// Finally, it toggles the typing status and returns the full response or an error if any occurred.
+func (bot *MatrixBot) queryAI(ctx context.Context, message string, room id.RoomID) (map[string]interface{}, error) {
+	//Prepare prompt, model and if exist system prompt
+	promptText := strings.ReplaceAll(strings.ReplaceAll(strings.TrimPrefix(message, "query "), bot.Name, ""), "  ", " ")
+	rawQuery := NewQuery().
+		WithModel(bot.Config.AI.Endpoints["chat"].Model).
+		WithPrompt(promptText).
+		WithStream(false).
+		WithSystem("Du är en svensk AI assistent som skall hjälpa användarna med deras frågor och behov. " +
+			"Du ska alltid svara på svenska. Du ska alltid vara artig och inkluderande. " +
+			"Du ska alltid använda ett artigt och inkluderande språk. " +
+			"Du ska bara svara på frågor och påståenden om det är lämpligt att prata om det i en " +
+			"professionell miljö som en arbetsplats. Var alltid detaljerad och noggran i dina svar." +
+			"Ta tid på dig och fundera grundligt på svaret innan du svarar. Om du får information given i en fråga" +
+			" använd den informationen i ditt svar.")
+
+	queryContext, ok := Contexts[room]
+	if ok {
+		rawQuery.WithContext(queryContext)
+	}
+
+	// Convert AIQuery to an io.Reader that http.Post can handle
+	requestBody := rawQuery.ToIOReader()
+
+	// Toogle the bot to be typing for 15 seconds periods before sending typing again
+	c := make(chan bool)
+	go func(c chan bool, bot *MatrixBot) {
+		for {
+			select {
+			case <-c:
+				return
+			default:
+				bot.Log.Debug().Msg("Sending typing as at least one room has asked the bot something")
+				bot.toggleTyping(ctx, room, true)
+				time.Sleep(30 * time.Second)
+			}
+		}
+	}(c, bot)
+
+	// Make the request to AI API
+	client := http.Client{
+		Timeout: 3600 * time.Second,
+	}
+	bot.Log.Info().Msg("Sending question to AI, waiting...")
+	resp, err := client.Post(fmt.Sprintf("%s:%s/%s", bot.Config.AI.Host, bot.Config.AI.Port, bot.Config.AI.Endpoints["chat"].Url), "application/json", requestBody)
+	if err != nil {
+		c <- true
+		if len(runningCmds) <= 1 {
+			bot.toggleTyping(ctx, room, false)
+		}
+		bot.Log.Error().
+			Err(err).
+			Msg("Error querying AI")
+		return nil, err
+	}
+
+	// We should now have the answer from the bot. Defer closing of the connection until we've read the data
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			bot.Log.Error().
+				Err(err).
+				Msg("Problem closing connection to AI")
+		}
+	}(resp.Body)
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c <- true
+		bot.toggleTyping(ctx, room, false)
+		bot.Log.Error().Err(err).Msg("Error reading answer from AI")
+		return nil, err
+	}
+
+	var fullResponse map[string]interface{}
+	err = json.Unmarshal(body, &fullResponse)
+	if err != nil {
+		c <- true
+		if len(runningCmds) <= 1 {
+			bot.toggleTyping(ctx, room, false)
+		}
+		bot.Log.Error().Err(err).Msg("Can't unmarshal JSON response from AI")
+		return nil, err
+	}
+
+	bot.Log.Info().Msg("Updating Context")
+	var botContext []int
+	if rawContext, ok := fullResponse["context"]; ok {
+		bot.Log.Debug().Msg("Retrieving Context from AI")
+		for _, v := range rawContext.([]interface{}) {
+			botContext = append(botContext, int(v.(float64)))
+		}
+	}
+	bot.Log.Debug().Msg("Updating Init Bot Context and saving to permanent storage")
+	Contexts[room] = botContext
+	err = bot.SaveContext(ctx, room)
+	if err != nil {
+		bot.Log.Warn().Err(err).Msg("Context will not survive restart")
+	}
+
+	// Toggle typing to false if we are the last ones running and then send reply
+	c <- true
+	if len(runningCmds) <= 1 {
+		bot.toggleTyping(ctx, room, false)
+	}
+
+	return fullResponse, nil
 }
