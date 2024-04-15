@@ -128,6 +128,10 @@ func main() {
 		config.LogLevel = *logLevel
 	}
 
+	if config.AI.PromptKey == "" {
+		config.AI.PromptKey = "response"
+	}
+
 	level, err := zerolog.ParseLevel(strings.ToLower(config.LogLevel))
 	if err != nil {
 		log.Error().Err(err).Msg("Couldn't parse log level")

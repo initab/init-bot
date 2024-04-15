@@ -26,6 +26,7 @@ type AI struct {
 	Host      string              `json:"host"`
 	Port      json.Number         `json:"port"`
 	Endpoints map[string]Endpoint `json:"endpoints"`
+	PromptKey string              `json:"prompt-key"`
 }
 
 type Endpoint struct {

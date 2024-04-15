@@ -28,7 +28,7 @@ func SetupSyncer(bot *MatrixBot) (MatrixBot, error) {
 			bot.Log.Debug().
 				Msgf("%s said \"%s\" in room %s", ev.Sender, messageEvent.Body, ev.RoomID)
 
-			bot.handleCommands(bot.Context, messageEvent.Body, ev.RoomID, ev.Sender)
+			bot.handleCommands(bot.Context, messageEvent, ev.RoomID, ev.Sender)
 
 		} else {
 			bot.Log.Debug().Msg("Message not for bot")

@@ -54,7 +54,7 @@ type CommandHandler struct {
 	MinPower int
 
 	//The function to handle this command
-	Handler func(ctx context.Context, message string, room id.RoomID, sender id.UserID)
+	Handler func(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID)
 
 	//Help to be displayed for this command
 	Help string
@@ -205,6 +205,7 @@ func NewMatrixBot(config types.Config, log *zerolog.Logger) (*MatrixBot, error) 
 	// Register the commands this bot should handle
 	bot.RegisterCommand("^help", 0, "Display this help", bot.handleCommandHelp)
 	bot.RegisterCommand("^search", 0, "Start message with 'search' to search SharePoint documents", bot.handleSearch)
+	bot.RegisterCommand("^avatar set", 0, "Set a new Avatar image for the bot. Image must be last part of an Matrix URI that starts with mxc:// and only the last par after the last / should be included. Also, the image referenced like that must be uploaded in an un-encrypted room!", bot.handleSetAvatar)
 	bot.RegisterCommand("", 0, "Default action is to Query the AI", bot.handleQueryAI)
 
 	return bot, nil
@@ -214,7 +215,7 @@ func NewMatrixBot(config types.Config, log *zerolog.Logger) (*MatrixBot, error) 
 // The handler function should have the signature func(ctx context.Context, message string, room id.RoomID, sender id.UserID).
 // It creates a new CommandHandler struct with the provided parameters and appends it to the bot's Handlers slice.
 // It also logs a debug message indicating the registration of the command handler.
-func (bot *MatrixBot) RegisterCommand(pattern string, minpower int, help string, handler func(ctx context.Context, message string, room id.RoomID, sender id.UserID)) {
+func (bot *MatrixBot) RegisterCommand(pattern string, minpower int, help string, handler func(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID)) {
 	mbch := CommandHandler{
 		Pattern:  pattern,
 		MinPower: minpower,
@@ -230,7 +231,7 @@ func (bot *MatrixBot) RegisterCommand(pattern string, minpower int, help string,
 // Then it iterates over the registered command handlers and checks if the message matches the pattern for each handler.
 // If a match is found, the corresponding handler function is called and the handled variable is set to true.
 // If no match is found, it treats the message as an AIQuery and calls the handler function for AIQuery using the queryIndex.
-func (bot *MatrixBot) handleCommands(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
+func (bot *MatrixBot) handleCommands(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
 	//Don't do anything if the sender is the bot itself
 	if strings.Contains(sender.String(), bot.matrixUser) {
 		bot.Log.Debug().Msg("Bots own message, ignore")
@@ -239,7 +240,7 @@ func (bot *MatrixBot) handleCommands(ctx context.Context, message string, room i
 
 	bot.Log.Info().Msg("Handling input...")
 	// Trim bot name, double spaces, and convert string to all lower case before trying to match with pattern of command
-	matchMessage := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(message, bot.Name+" ", ""), bot.Name, ""), "  ", " "))
+	matchMessage := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(message.Body, bot.Name+" ", ""), bot.Name, ""), "  ", " "))
 	bot.Log.Debug().
 		Str("message", matchMessage).
 		Str("user", sender.String()).
@@ -254,7 +255,7 @@ func (bot *MatrixBot) handleCommands(ctx context.Context, message string, room i
 		r, _ := regexp.Compile(v.Pattern)
 		if r.MatchString(matchMessage) {
 			handled = true
-			cmdContext, cmdCancelFunc := context.WithDeadline(ctx, time.Now().Local().Add(20*time.Minute))
+			cmdContext, cmdCancelFunc := context.WithTimeout(ctx, 10*time.Minute)
 			runningCmds[cmdContext] = &cmdCancelFunc
 			go v.Handler(cmdContext, message, room, sender)
 		}
@@ -273,10 +274,7 @@ func (bot *MatrixBot) handleCommands(ctx context.Context, message string, room i
 // and appends their pattern and help message to a help message string.
 //
 // The help message is then sent as a notice to the specified room.
-func (bot *MatrixBot) handleCommandHelp(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
-	if len(message) > 0 {
-		bot.Log.Info().Msg(message)
-	}
+func (bot *MatrixBot) handleCommandHelp(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
 	helpMsg := `# Init Bot Help
 The bot will only react when you @ the bot. Commands do not take @Init-Bot into account when evaluating for commands. All commands are case insensitive
 
@@ -296,9 +294,8 @@ The following commands are avaitible for this bot:
 			Err(err).
 			Msg("Error sending help message")
 	}
-	ctx.Done()
+	(*runningCmds[ctx])()
 	delete(runningCmds, ctx)
-	// (*runningCmds[ctx])() // run cancel function
 }
 
 // handleQueryAI handles the processing of a query from a user and sends it to the AI for a response.
@@ -306,9 +303,8 @@ The following commands are avaitible for this bot:
 // makes the request to the AI API, reads and parses the response,
 // updates the bot's context and saves it to permanent storage,
 // and finally sends the response back to the user.
-func (bot *MatrixBot) handleQueryAI(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
-
-	response, err := bot.queryAI(ctx, message, room)
+func (bot *MatrixBot) handleQueryAI(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
+	response, err := bot.queryAI(ctx, message.Body, bot.Config.AI.Endpoints["chat"].Model, room)
 	if err != nil {
 		bot.Log.Error().
 			Err(err).
@@ -316,15 +312,17 @@ func (bot *MatrixBot) handleQueryAI(ctx context.Context, message string, room id
 		return
 	}
 
+	bot.Log.Debug().Any("response", response).Msg("AI response")
+
 	// We have the data, formulate a reply
-	_, err = bot.sendHTMLNotice(ctx, room, response["response"].(string))
+	_, err = bot.sendHTMLNotice(ctx, room, response[bot.Config.AI.PromptKey].(string))
 	if err != nil {
 		bot.Log.Error().
 			Err(err).
 			Msg("Couldn't send response back to user")
 	}
 	bot.Log.Info().Msg("Sent response back to user")
-	ctx.Done()
+	(*runningCmds[ctx])()
 	delete(runningCmds, ctx)
 	// (*runningCmds[ctx])() // run cancel function
 }
@@ -332,9 +330,9 @@ func (bot *MatrixBot) handleQueryAI(ctx context.Context, message string, room id
 // handleSearch performs a search using Ollama and ChromaDB
 // It prepares the prompt text, Ollama and ChromaDB clients, and retrieves the collection from ChromaDB.
 // Then it queries ChromaDB with the prompt text and sends the response to handleQueryAI function.
-func (bot *MatrixBot) handleSearch(ctx context.Context, message string, room id.RoomID, sender id.UserID) {
+func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
 	//Prepare prompt, model and if exist system prompt
-	promptText := strings.ReplaceAll(strings.ReplaceAll(strings.TrimPrefix(message, "search "), bot.Name, ""), "  ", " ")
+	promptText := strings.ReplaceAll(strings.ReplaceAll(strings.TrimPrefix(message.Body, "search "), bot.Name, ""), "  ", " ")
 
 	url := ollama.WithBaseURL(bot.Config.AI.Host + ":" + bot.Config.AI.Port.String())
 	model := ollama.WithModel("mxbai-embed-large")
@@ -369,7 +367,7 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message string, room id.
 
 	promptAI := fmt.Sprintf("Använd denna information: \"%s\". För att besvara denna fråga: \"%s\"", qresp.Documents[0][0], promptText)
 
-	response, err := bot.queryAI(ctx, promptAI, room)
+	response, err := bot.queryAI(ctx, promptAI, bot.Config.AI.Endpoints["chat"].Model, room)
 	if err != nil {
 		bot.Log.Error().Err(err).Msg("Error using Search response in AI query")
 	}
@@ -388,6 +386,29 @@ Från denna länk: ` + strings.Split(strings.Split(qresp.Documents[0][0], "Link:
 	ctx.Done()
 	delete(runningCmds, ctx)
 	// (*runningCmds[ctx])() // run cancel function
+
+}
+
+// handleSetAvatar handles the "avatar set" command by extracting the avatar URL from the message body,
+// retrieving the home server URL from the bot's configuration, and using the matrix client to set the avatar URL.
+// It logs an error message if setting the avatar fails.
+func (bot *MatrixBot) handleSetAvatar(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
+
+	body := message.Body
+
+	rtrimEvent := strings.Split(body, "avatar set ")[1]
+	imgUrl := strings.Split(rtrimEvent, " ")[0]
+	homeServer := strings.Split(bot.Config.Homeserver, "https://")[1]
+
+	err := bot.Client.SetAvatarURL(ctx, id.ContentURI{Homeserver: homeServer, FileID: imgUrl})
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Couldn't set avatar")
+	}
+}
+
+func (bot *MatrixBot) handleQueryTtI(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
 
 }
 
@@ -453,6 +474,9 @@ func (bot *MatrixBot) LoadContext(ctx context.Context, room id.RoomID) error {
 	return nil
 }
 
+// CancelRunningHandlers cancels all currently running command handlers. It iterates over
+// the runningCmds map and calls the cancel function associated with each command context.
+// After canceling the function, it removes the entry from the runningCmds map.
 func (bot *MatrixBot) CancelRunningHandlers(ctx context.Context) {
 	for cmdCtx, cancelFunc := range runningCmds {
 		(*cancelFunc)()
@@ -496,20 +520,13 @@ func (bot *MatrixBot) toggleTyping(ctx context.Context, room id.RoomID, isTyping
 // The response is read, parsed, and returned as a map[string]interface{}.
 // The method also updates the bot's context based on the response, if available, and saves it to permanent storage.
 // Finally, it toggles the typing status and returns the full response or an error if any occurred.
-func (bot *MatrixBot) queryAI(ctx context.Context, message string, room id.RoomID) (map[string]interface{}, error) {
+func (bot *MatrixBot) queryAI(ctx context.Context, message string, model string, room id.RoomID) (map[string]interface{}, error) {
 	//Prepare prompt, model and if exist system prompt
 	promptText := strings.ReplaceAll(strings.ReplaceAll(strings.TrimPrefix(message, "query "), bot.Name, ""), "  ", " ")
 	rawQuery := NewQuery().
-		WithModel(bot.Config.AI.Endpoints["chat"].Model).
+		WithModel(model).
 		WithPrompt(promptText).
-		WithStream(false).
-		WithSystem("Du är en svensk AI assistent som skall hjälpa användarna med deras frågor och behov. " +
-			"Du ska alltid svara på svenska. Du ska alltid vara artig och inkluderande. " +
-			"Du ska alltid använda ett artigt och inkluderande språk. " +
-			"Du ska bara svara på frågor och påståenden om det är lämpligt att prata om det i en " +
-			"professionell miljö som en arbetsplats. Var alltid detaljerad och noggran i dina svar." +
-			"Ta tid på dig och fundera grundligt på svaret innan du svarar. Om du får information given i en fråga" +
-			" använd den informationen i ditt svar.")
+		WithStream(false)
 
 	queryContext, ok := Contexts[room]
 	if ok {
