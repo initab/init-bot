@@ -391,6 +391,8 @@ Från denna länk: ` + strings.Split(strings.Split(qresp.Documents[0][0], "Link:
 
 // handleSetAvatar handles the "avatar set" command by extracting the avatar URL from the message body,
 // retrieving the home server URL from the bot's configuration, and using the matrix client to set the avatar URL.
+// The URL needs to be the last part of a Matrix URI Ex: mxc://matrix.init.se/SDfskjw29ewi then SDfskjw29ewi is the part that should be used by the avatar set command
+// The URL also need to point to an image that is *NOT* encrypted, as Matrix doesn't handle encrypted avatars. At least I couldn't get it to work.
 // It logs an error message if setting the avatar fails.
 func (bot *MatrixBot) handleSetAvatar(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
 
