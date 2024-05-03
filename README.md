@@ -10,4 +10,4 @@ Type out _how to use_ instructions.
 Instructions for building the code from source
 ### Prerequisites
 You need to install OLM (double ratchet cryptographic library) for this to work.
-Look through your package provider or similar for _libolm_ or _libolm-devel_ or similar.
+Look through your package provider or similar for _libolm_ or _libolm-devel_ or _libolm-dev_ similar.

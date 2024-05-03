@@ -33,3 +33,16 @@ type Endpoint struct {
 	Url   string `json:"url"`
 	Model string `json:"model"`
 }
+
+type VectorResponse struct {
+	IDs       []string                 `json:"ids"`
+	Documents []string                 `json:"documents"`
+	Distances []float64                `json:"distances"`
+	Metadata  []map[string]interface{} `json:"metadata"`
+}
+
+type TopicClassifications struct {
+	Sequence string    `json:"sequence"`
+	Labels   []string  `json:"labels"`
+	Scores   []float64 `json:"scores"`
+}
