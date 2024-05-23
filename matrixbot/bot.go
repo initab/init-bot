@@ -72,13 +72,11 @@ var RoomsWithTyping = make(map[id.RoomID]int)
 var RoomChannel = make(map[id.RoomID]chan bool)
 
 // Headers
-const BeginOfText = "<|begin_of_text|>"
 const EndOfText = "<|eot_id|>"
 
 const HeaderStart = "<|start_header_id|>"
 const HeaderEnd = "<|end_header_id|>"
 
-var SystemPromptHeader = fmt.Sprintf("%ssystem%s", HeaderStart, HeaderEnd)
 var UserPromptHeader = fmt.Sprintf("%suser%s%", HeaderStart, HeaderEnd)
 var AssistantPromptHeader = fmt.Sprintf("%sassistant%s%", HeaderStart, HeaderEnd)
 
@@ -178,7 +176,7 @@ func NewMatrixBot(config types.Config, log *zerolog.Logger) (*MatrixBot, error) 
 			Msg("Problem setting up Syncer and Event handlers")
 	}
 
-	// Set up the cryptohelper with a PG backend so we can save crypto keys between restarts
+	// Set up the cryptohelper with a PG backend, so we can save crypto keys between restarts
 	database, err := dbutil.NewWithDialect(fmt.Sprintf("postgres://%s:%s@%s:%s/%s", config.DB.User, config.DB.Password, config.DB.Host, config.DB.Port, config.DB.DBName), "pgx")
 	if err != nil {
 		bot.Log.Error().
@@ -276,7 +274,6 @@ func NewMatrixBot(config types.Config, log *zerolog.Logger) (*MatrixBot, error) 
 
 	// Register the commands this bot should handle
 	bot.RegisterCommand("sökning", 0, "Start message with 'search' to search SharePoint documents", bot.handleSearch)
-	bot.RegisterCommand("avatarbyte", 0, "Set a new Avatar image for the bot. Image must be last part of an Matrix URI that starts with mxc:// and only the last par after the last / should be included. Also, the image referenced like that must be uploaded in an un-encrypted room!", bot.handleSetAvatar)
 	bot.RegisterCommand("bildgenerering", 0, "Generate an image via AI and send to the Matrix Chat Room", bot.handleGenerateImage)
 	bot.RegisterCommand("", 0, "Default action is to Query the AI", bot.handleQueryAI)
 
@@ -544,7 +541,7 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEv
 		}
 	}
 
-	for url, _ := range urls {
+	for url := range urls {
 		metadata += fmt.Sprintf("url: %v\n", url)
 	}
 
@@ -560,32 +557,6 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEv
 	bot.Log.Info().Msg("Sent response back to user")
 	bot.toggleTyping(ctx, room, false)
 	return
-}
-
-// handleSetAvatar handles the "avatar set" command by extracting the avatar URL from the message body,
-// retrieving the home server URL from the bot's configuration, and using the matrix client to set the avatar URL.
-// The URL needs to be the last part of a Matrix URI Ex: mxc://matrix.init.se/SDfskjw29ewi then SDfskjw29ewi is the part that should be used by the avatar set command
-// The URL also need to point to an image that is *NOT* encrypted, as Matrix doesn't handle encrypted avatars. At least I couldn't get it to work.
-// It logs an error message if setting the avatar fails.
-func (bot *MatrixBot) handleSetAvatar(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
-	defer cancelContext(ctx)
-	/*body := message.Body
-
-	rtrimEvent := strings.Split(body, "avatar set ")[1]
-	imgUrl := strings.Split(rtrimEvent, " ")[0]
-	homeServer := strings.Split(bot.Config.Homeserver, "https://")[1]
-
-	err := bot.Client.SetAvatarURL(ctx, id.ContentURI{Homeserver: homeServer, FileID: imgUrl})
-	if err != nil {
-		bot.Log.Error().
-			Err(err).
-			Msg("Couldn't set avatar")
-	}*/
-	_, err := bot.sendHTMLNotice(ctx, room, "<i><b>Ledsen, att byta avatar är inte implementerat just nu</b></i>", &sender)
-	if err != nil {
-		bot.Log.Warn().Err(err).Msg("Couldn't send response back to user")
-	}
-	bot.toggleTyping(ctx, room, false)
 }
 
 func (bot *MatrixBot) handleGenerateImage(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
@@ -778,7 +749,7 @@ func (bot *MatrixBot) LoadContext(ctx context.Context, room id.RoomID) error {
 // CancelRunningHandlers cancels all currently running command handlers. It iterates over
 // the runningCmds map and calls the cancel function associated with each command context.
 // After canceling the function, it removes the entry from the runningCmds map.
-func (bot *MatrixBot) CancelRunningHandlers(ctx context.Context) {
+func (bot *MatrixBot) CancelRunningHandlers() {
 	for cmdCtx, cancelFunc := range runningCmds {
 		(*cancelFunc)()
 		delete(runningCmds, cmdCtx)

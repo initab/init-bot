@@ -235,7 +235,7 @@ func stopBot() {
 	if err != nil {
 		bot.Log.Warn().Msg("Couldn't set 'Offline' presence")
 	}
-	bot.CancelRunningHandlers(bot.Context)
+	bot.CancelRunningHandlers()
 	bot.Log.Debug().Msg("Stopping sync")
 	bot.Client.StopSync()
 	bot.Log.Debug().Msg("Logging out")
