@@ -61,6 +61,7 @@ func main() {
 	dbPassword := flag.String("db-password", "", "Override Database Password from config")
 	dbName := flag.String("db-name", "", "Override Database Name from config")
 	logLevel := flag.String("log-level", "", "Override Log Level for bot")
+	timeout := flag.Int64("timeout", -1, "Override Timeout for bot waiting on AI response")
 
 	flag.Parse()
 
@@ -128,8 +129,32 @@ func main() {
 		config.LogLevel = *logLevel
 	}
 
-	if config.AI.PromptKey == "" {
-		config.AI.PromptKey = "response"
+	if *timeout != -1 {
+		config.AI.Timeout = *timeout
+	}
+
+	// This loop iterates over each of the AI endpoints specified in the config.
+	// If the host, port, num_results or response key of an endpoint is not provided,
+	// it assigns them default values from the main AI config or default values. This ensures
+	// that all endpoints have these necessary properties set. Some endpoints won't use them.
+	// but that is a different matter.
+	for k, v := range config.AI.Endpoints {
+		if v.Host == "" {
+			v.Host = config.AI.Host
+		}
+		if v.Port == "" {
+			v.Port = config.AI.Port
+		}
+		if v.ResponseKey == "" {
+			v.ResponseKey = "response"
+		}
+
+		if v.NumResults == "" {
+			if v.NumResults == "" {
+				v.NumResults = "10"
+			}
+		}
+		config.AI.Endpoints[k] = v
 	}
 
 	level, err := zerolog.ParseLevel(strings.ToLower(config.LogLevel))
@@ -176,12 +201,12 @@ func main() {
 	}
 	respRooms, err := bot.Client.JoinedRooms(bot.Context)
 	if err != nil {
-		bot.Log.Info().Msg("Couldn't get joined rooms. Won't say goodbye")
+		bot.Log.Info().Msg("Couldn't get joined rooms. Won't say hello/goodbye")
 	} else {
 		for _, v := range respRooms.JoinedRooms {
 			_, innerErr := bot.Client.SendNotice(bot.Context, v, "I'm Online again. Hello!")
 			if innerErr != nil {
-				bot.Log.Info().Err(err).Any("room", v).Msgf("Couldn't say hello in room %s", v)
+				bot.Log.Info().Err(err).Any("room", v).Msg("Couldn't say hello")
 			}
 		}
 	}

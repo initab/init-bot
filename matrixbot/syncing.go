@@ -28,7 +28,7 @@ func SetupSyncer(bot *MatrixBot) (MatrixBot, error) {
 			bot.Log.Debug().
 				Msgf("%s said \"%s\" in room %s", ev.Sender, messageEvent.Body, ev.RoomID)
 
-			bot.handleCommands(bot.Context, messageEvent, ev.RoomID, ev.Sender)
+			bot.handleCommands(ctx, messageEvent, ev.RoomID, ev.Sender)
 
 		} else {
 			bot.Log.Debug().Msg("Message not for bot")
@@ -53,8 +53,6 @@ func SetupSyncer(bot *MatrixBot) (MatrixBot, error) {
 					Msgf("Joined room %s", resp.RoomID)
 			}
 		} else if eventMember.Membership.IsLeaveOrBan() {
-			bot.Log.Debug().
-				Msgf("Kicked from room %S", ev.RoomID)
 			bot.Log.Info().
 				Msgf("Kicked from %s for reason: %s", ev.RoomID, eventMember.Reason)
 		}

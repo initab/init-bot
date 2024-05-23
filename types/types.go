@@ -23,15 +23,20 @@ type DB struct {
 }
 
 type AI struct {
-	Host      string              `json:"host"`
-	Port      json.Number         `json:"port"`
-	Endpoints map[string]Endpoint `json:"endpoints"`
-	PromptKey string              `json:"prompt-key"`
+	Host                    string              `json:"host"`
+	Port                    json.Number         `json:"port"`
+	ClassificationThreshold json.Number         `json:"classification_threshold"`
+	Timeout                 int64               `json:"timeout"`
+	Endpoints               map[string]Endpoint `json:"endpoints"`
 }
 
 type Endpoint struct {
-	Url   string `json:"url"`
-	Model string `json:"model"`
+	Url         string      `json:"url"`
+	Model       string      `json:"model,omitempty"`
+	Host        string      `json:"host,omitempty"`
+	Port        json.Number `json:"port,omitempty"`
+	ResponseKey string      `json:"response_key,omitempty"`
+	NumResults  json.Number `json:"num_results,omitempty"`
 }
 
 type VectorResponse struct {

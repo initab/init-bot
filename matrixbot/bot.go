@@ -11,13 +11,13 @@ import (
 	"go.mau.fi/util/dbutil"
 	"init-bot/types"
 	"io"
+	"maunium.net/go/mautrix/crypto/attachment"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
 	"net/http"
 	"regexp"
 	"strings"
 	"syscall"
-	"text/template"
 	"time"
 
 	"maunium.net/go/mautrix"
@@ -65,6 +65,23 @@ var runningCmds = make(map[context.Context]*context.CancelFunc)
 // Contexts is a map that stores the context values for each room in the bot.
 var Contexts = make(map[id.RoomID][]int)
 
+// RoomsWithTyping is a map that stores the typing status for each room in the bot.
+var RoomsWithTyping = make(map[id.RoomID]int)
+
+// RoomChannel is a map that stores a boolean channel for each room in the system.
+var RoomChannel = make(map[id.RoomID]chan bool)
+
+// Headers
+const BeginOfText = "<|begin_of_text|>"
+const EndOfText = "<|eot_id|>"
+
+const HeaderStart = "<|start_header_id|>"
+const HeaderEnd = "<|end_header_id|>"
+
+var SystemPromptHeader = fmt.Sprintf("%ssystem%s", HeaderStart, HeaderEnd)
+var UserPromptHeader = fmt.Sprintf("%suser%s%", HeaderStart, HeaderEnd)
+var AssistantPromptHeader = fmt.Sprintf("%sassistant%s%", HeaderStart, HeaderEnd)
+
 // cancelContext cancels the context and removes it from the runningCmds map.
 // It retrieves the cancel function from the runningCmds map using the provided context.
 // Then, it calls the cancel function to cancel the context.
@@ -78,6 +95,45 @@ func cancelContext(ctx context.Context) bool {
 	(*cancelFunc)()
 	delete(runningCmds, ctx)
 	return true
+}
+
+func HandleRoomTyping(room id.RoomID, counter int, bot *MatrixBot) {
+	var roomCount = 0
+	roomCount = RoomsWithTyping[room]
+
+	// Add new counter (±1) to old counter and see if this was the first or last workload in that room
+	newCount := roomCount + counter
+	bot.Log.Debug().Msgf("Counter for room %v is %d", room, newCount)
+	if newCount < 0 {
+		newCount = 0
+	}
+	if newCount == 1 {
+		bot.Log.Debug().Msg("Starting up typing")
+		RoomChannel[room] = make(chan bool)
+		go startTyping(context.Background(), room, RoomChannel[room], bot)
+	} else if newCount == 0 {
+		bot.Log.Debug().Msg("Sending true to channel!")
+		RoomChannel[room] <- true
+		delete(RoomChannel, room)
+	}
+	// Update counter
+	RoomsWithTyping[room] = newCount
+}
+
+func startTyping(ctx context.Context, room id.RoomID, c chan bool, bot *MatrixBot) {
+	// Toogle the bot to be typing for 30 seconds periods before sending typing again
+	for {
+		select {
+		case <-c:
+			bot.Log.Info().Msg("Done typing")
+			bot.toggleTyping(ctx, room, false)
+			return
+		default:
+			bot.Log.Info().Msg("Sending typing as at least one room has asked the bot something")
+			bot.toggleTyping(ctx, room, true)
+			time.Sleep(30 * time.Second)
+		}
+	}
 }
 
 // NewMatrixBot creates a new MatrixBot instance with the provided configuration.
@@ -209,6 +265,7 @@ func NewMatrixBot(config types.Config, log *zerolog.Logger) (*MatrixBot, error) 
 
 		// Use the room column as key to Contexts variable and save the roomContext column
 		Contexts[id.RoomID(roomID)] = roomContext
+		RoomsWithTyping[id.RoomID(roomID)] = 0
 	}
 	rows.Close()
 
@@ -218,9 +275,9 @@ func NewMatrixBot(config types.Config, log *zerolog.Logger) (*MatrixBot, error) 
 	bot.Config = config
 
 	// Register the commands this bot should handle
-	bot.RegisterCommand("help", 0, "Display this help", bot.handleCommandHelp)
-	bot.RegisterCommand("search", 0, "Start message with 'search' to search SharePoint documents", bot.handleSearch)
-	bot.RegisterCommand("avatar set", 0, "Set a new Avatar image for the bot. Image must be last part of an Matrix URI that starts with mxc:// and only the last par after the last / should be included. Also, the image referenced like that must be uploaded in an un-encrypted room!", bot.handleSetAvatar)
+	bot.RegisterCommand("sökning", 0, "Start message with 'search' to search SharePoint documents", bot.handleSearch)
+	bot.RegisterCommand("avatarbyte", 0, "Set a new Avatar image for the bot. Image must be last part of an Matrix URI that starts with mxc:// and only the last par after the last / should be included. Also, the image referenced like that must be uploaded in an un-encrypted room!", bot.handleSetAvatar)
+	bot.RegisterCommand("bildgenerering", 0, "Generate an image via AI and send to the Matrix Chat Room", bot.handleGenerateImage)
 	bot.RegisterCommand("", 0, "Default action is to Query the AI", bot.handleQueryAI)
 
 	return bot, nil
@@ -250,6 +307,9 @@ func (bot *MatrixBot) handleCommands(ctx context.Context, message *event.Message
 	//Don't do anything if the sender is the bot itself
 	if strings.Contains(sender.String(), bot.matrixUser) {
 		bot.Log.Debug().Msg("Bots own message, ignore")
+		if message.MsgType == event.MsgImage {
+			bot.Log.Debug().Any("message", message).Msg("Image message")
+		}
 		return
 	}
 
@@ -263,26 +323,31 @@ func (bot *MatrixBot) handleCommands(ctx context.Context, message *event.Message
 		Str("user_message", matchMessage).
 		Msg("Message from the user")
 
+	bot.Log.Debug().
+		Any("RunnningCMDs", runningCmds).
+		Msg("Running CMDs")
 	// Make the request to AI API
 	client := http.Client{
-		Timeout: 30 * time.Minute,
+		Timeout: time.Duration(bot.Config.AI.Timeout) * time.Minute,
 	}
-	templateString := "{{$first := true}}{{range $key, $value := $}}{{if $first}}[{{$first = false}}{{else}}, {{end}}{{$value.Pattern}}{{end}}"
-	templ := template.Must(template.New("example").Parse(templateString))
-	builder := &strings.Builder{}
-	err := templ.Execute(builder, templ)
+	var handlerPatterns []string
+	for _, handler := range bot.Handlers {
+		if handler.Pattern != "" {
+			handlerPatterns = append(handlerPatterns, handler.Pattern)
+		}
+	}
+	bot.Log.Debug().Msgf("Patterns: %v", handlerPatterns)
+	labelsStr, err := json.Marshal(handlerPatterns)
 	if err != nil {
-		bot.Log.Error().
-			Err(err).
-			Msg("Error executing template")
+		bot.Log.Error().Err(err).Msg("Error marshaling handler patterns")
 		cancelContext(ctx)
 		return
 	}
-	labelsStr := builder.String() + "]"
-	data := "{\"text\": \"" + matchMessage + "\", \"labels\": " + labelsStr + "}"
+	data := "{\"text\": \"" + matchMessage + "\", \"labels\": " + string(labelsStr) + "}"
 	bot.Log.Debug().Any("request", data).Msg("Sending Body data")
-
-	resp, err := client.Post("http://localhost:8081/api/classify", "application/json", bytes.NewBuffer([]byte(data)))
+	// Build the URL to Classify AI from config
+	classifyURL := bot.Config.AI.Endpoints["classify"].Host + ":" + string(bot.Config.AI.Endpoints["classify"].Port) + "/" + bot.Config.AI.Endpoints["classify"].Url
+	resp, err := client.Post(classifyURL, "application/json", bytes.NewBuffer([]byte(data)))
 	if err != nil {
 		bot.Log.Error().Err(err).Msg("Error making request to Topic Classification API")
 		cancelContext(ctx)
@@ -321,6 +386,7 @@ func (bot *MatrixBot) handleCommands(ctx context.Context, message *event.Message
 		cancelContext(ctx)
 		return
 	}
+
 	handled := false
 	var queryIndex int
 	for k, v := range bot.Handlers {
@@ -329,49 +395,30 @@ func (bot *MatrixBot) handleCommands(ctx context.Context, message *event.Message
 			continue
 		}
 		r, _ := regexp.Compile(v.Pattern)
-		if r.MatchString(matchMessage) {
-			bot.Log.Info().Msgf("Handling message of type: %s", v.Pattern)
-			handled = true
-			cmdContext, cmdCancelFunc := context.WithTimeout(ctx, 30*time.Minute)
-			runningCmds[cmdContext] = &cmdCancelFunc
-			go v.Handler(cmdContext, message, room, sender)
+		threshold, err := bot.Config.AI.ClassificationThreshold.Float64()
+		if err != nil {
+			bot.Log.Warn().
+				Err(err).
+				Msg("Error converting Json Number for Classification Threshold to Float64. Setting it to 85%")
+			threshold = 0.85
+		}
+		for i, j := range fullResponse.Labels {
+			if r.MatchString(j) && fullResponse.Scores[i] >= threshold {
+				bot.Log.Info().Msgf("Handling message of type: %s", v.Pattern)
+				handled = true
+				cmdContext, cmdCancelFunc := context.WithTimeout(ctx, time.Duration(bot.Config.AI.Timeout)*time.Minute)
+				runningCmds[cmdContext] = &cmdCancelFunc
+				go v.Handler(cmdContext, message, room, sender)
+			}
 		}
 
 	}
 	if !handled {
-		bot.Log.Debug().Msg("Could not find a pattern to handle, treat this as AIQuery")
-		cmdContext, cmdCancelFunc := context.WithTimeout(ctx, 30*time.Minute)
+		bot.Log.Debug().Msg("Could not find a pattern to handle, treat this as general chatting")
+		cmdContext, cmdCancelFunc := context.WithTimeout(ctx, time.Duration(bot.Config.AI.Timeout)*time.Minute)
 		runningCmds[cmdContext] = &cmdCancelFunc
 		go bot.Handlers[queryIndex].Handler(cmdContext, message, room, sender)
 	}
-}
-
-// handleCommandHelp displays the list of available commands for the bot
-// in a formatted message. It iterates over the registered command handlers
-// and appends their pattern and help message to a help message string.
-//
-// The help message is then sent as a notice to the specified room.
-func (bot *MatrixBot) handleCommandHelp(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
-	helpMsg := `# Init Bot Help
-The bot will only react when you @ the bot. Commands do not take @Init-Bot into account when evaluating for commands. All commands are case insensitive
-
-The following commands are avaitible for this bot:
-
-|Command|Explanation|
-|---|---|`
-
-	for _, v := range bot.Handlers {
-		helpMsg = helpMsg + "\n|@init-bot " + v.Pattern + "|" + v.Help + "|"
-	}
-
-	sendMsg := format.RenderMarkdown(helpMsg, true, true)
-	_, err := bot.sendHTMLNotice(ctx, room, sendMsg.FormattedBody)
-	if err != nil {
-		bot.Log.Error().
-			Err(err).
-			Msg("Error sending help message")
-	}
-	cancelContext(ctx)
 }
 
 // handleQueryAI handles the processing of a query from a user and sends it to the AI for a response.
@@ -380,54 +427,61 @@ The following commands are avaitible for this bot:
 // updates the bot's context and saves it to permanent storage,
 // and finally sends the response back to the user.
 func (bot *MatrixBot) handleQueryAI(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
-	response, err := bot.queryAI(ctx, message.Body, bot.Config.AI.Endpoints["chat"].Model, room)
+	defer cancelContext(ctx)
+	// Handle bot typing
+	HandleRoomTyping(room, 1, bot)
+	defer HandleRoomTyping(room, -1, bot)
+
+	response, err := bot.queryAI(ctx, message.Body, "", bot.Config.AI.Endpoints["chat"].Model, room)
 	if err != nil {
 		bot.Log.Error().
 			Err(err).
 			Msg("Couldn't query AI")
-		cancelContext(ctx)
 		return
 	}
 
 	bot.Log.Debug().Any("response", response).Msg("AI response")
 
 	// We have the data, formulate a reply
-	_, err = bot.sendHTMLNotice(ctx, room, response[bot.Config.AI.PromptKey].(string))
+	_, err = bot.sendHTMLNotice(ctx, room, response[bot.Config.AI.Endpoints["chat"].ResponseKey].(string), &sender)
 	if err != nil {
 		bot.Log.Error().
 			Err(err).
 			Msg("Couldn't send response back to user")
-		cancelContext(ctx)
 	}
 	bot.Log.Info().Msg("Sent response back to user")
-	cancelContext(ctx)
+	bot.toggleTyping(ctx, room, false)
 }
 
 // handleSearch performs a search using Ollama and ChromaDB
 // It prepares the prompt text, Ollama and ChromaDB clients, and retrieves the collection from ChromaDB.
 // Then it queries ChromaDB with the prompt text and sends the response to handleQueryAI function.
 func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
+	defer cancelContext(ctx)
+	// Handle bot typing
+	HandleRoomTyping(room, 1, bot)
+	defer HandleRoomTyping(room, -1, bot)
+
 	bot.Log.Debug().Msg("Handling a Search query")
 	//Prepare prompt, model and if exist system prompt
-	promptText := bot.regexTrimLeft("search", message.Body)
-	// Make the request to AI API
+	promptText := bot.regexTrimLeft("", message.Body)
+
 	client := http.Client{
-		Timeout: 30 * time.Minute,
+		Timeout: time.Duration(bot.Config.AI.Timeout) * time.Minute,
 	}
 
-	data := "{\"prompt\": \"" + promptText + "\", \"num_results\": 1}"
+	data := fmt.Sprintf("{\"prompt\": \"%s\", \"num_results\": %s}", promptText, bot.Config.AI.Endpoints["search"].NumResults)
 	bot.Log.Debug().Any("request", data).Msg("Sending Body data")
-
-	resp, err := client.Post("http://localhost:8080/api/search", "application/json", bytes.NewBuffer([]byte(data)))
+	// Build searchURL string from config
+	searchURL := bot.Config.AI.Endpoints["search"].Host + ":" + string(bot.Config.AI.Endpoints["search"].Port) + "/" + bot.Config.AI.Endpoints["search"].Url
+	resp, err := client.Post(searchURL, "application/json", bytes.NewBuffer([]byte(data)))
 	if err != nil {
 		bot.Log.Error().Err(err).Msg("Error making request to Vector Search API")
-		cancelContext(ctx)
 		return
 	}
 	defer func(Body io.ReadCloser) {
 		err := Body.Close()
 		if err != nil {
-			cancelContext(ctx)
 			bot.Log.Error().Err(err).Msg("An error occurred closing Body")
 		}
 	}(resp.Body)
@@ -435,14 +489,12 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEv
 	// Check if the response status code is not 200
 	if resp.StatusCode != http.StatusOK {
 		bot.Log.Error().Msgf("Vector Search API returned non-200 status code: %d", resp.StatusCode)
-		cancelContext(ctx)
 		return
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		bot.Log.Error().Err(err).Msg("Error reading answer from Vector search")
-		cancelContext(ctx)
 		return
 	}
 
@@ -455,44 +507,59 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEv
 	err = json.Unmarshal([]byte(strBody), &fullResponse)
 	if err != nil {
 		bot.Log.Error().Err(err).Msg("Can't unmarshal JSON response from Vector search")
-		cancelContext(ctx)
 		return
 	}
 
+	criteria := "You are a grader assessing relevance of a retrieved document to a user question. \n" +
+		"If the document is factually relevant to the user question, grade it as relevant. \n" +
+		"It does not need to be a stringent test. The goal is to filter out erroneous retrievals. \n" +
+		"Give a binary score 'yes' or 'no' to indicate whether the document is relevant to the questions \n " +
+		"Provide the binary score as a JSON with a single key 'score' and no preamble or explanation."
+
+	bot.Log.Debug().Msg("Qualifying docs")
+	qualifiedDocs := bot.qualifySearch(fullResponse.Documents, promptText, criteria)
+	bot.Log.Debug().Msgf("Index of qualified docs: %v", qualifiedDocs)
+
 	var documents string
-	for _, doc := range fullResponse.Documents {
-		documents = documents + "; " + doc
+	for _, docIndex := range qualifiedDocs {
+		documents = documents + "; \n" + fullResponse.Documents[docIndex]
 	}
 
-	promptAI := fmt.Sprintf("Använd denna data:\n\n%s \n\n"+
-		"För att besvara denna fråga noggrant och korrekt genom att bara använda datan du har tillgång till: \n%s",
-		promptText, documents)
+	promptAI := fmt.Sprintf("Use this data:\n%s\n To answer this question: %s",
+		documents, promptText)
 
-	response, err := bot.queryAI(ctx, promptAI, bot.Config.AI.Endpoints["chat"].Model, room)
+	response, err := bot.queryAI(ctx, promptAI, "", bot.Config.AI.Endpoints["chat"].Model, room)
 	if err != nil {
 		bot.Log.Error().Err(err).Msg("Error using Search response in AI query")
-		cancelContext(ctx)
 	}
 
+	var urls = make(map[string]bool)
 	metadata := "\n\n_**Metadata:**_\n"
-	for _, meta := range fullResponse.Metadata {
+	for _, docIndex := range qualifiedDocs {
+		meta := fullResponse.Metadata[docIndex]
 		for key, value := range meta {
-			metadata += fmt.Sprintf("%s: %v\n", key, value)
+			if key == "url" {
+				urls[value.(string)] = true
+			}
 		}
 	}
-	reply := response["response"].(string) + metadata
+
+	for url, _ := range urls {
+		metadata += fmt.Sprintf("url: %v\n", url)
+	}
+
+	reply := response[bot.Config.AI.Endpoints["chat"].ResponseKey].(string) + metadata
 	// We have the data, formulate a reply
 	replyMessage := format.RenderMarkdown(reply, true, true)
-	_, err = bot.sendHTMLNotice(ctx, room, replyMessage.FormattedBody)
+	_, err = bot.sendHTMLNotice(ctx, room, replyMessage.FormattedBody, &sender)
 	if err != nil {
 		bot.Log.Error().
 			Err(err).
 			Msg("Couldn't send response back to user")
 	}
 	bot.Log.Info().Msg("Sent response back to user")
-
-	cancelContext(ctx)
-
+	bot.toggleTyping(ctx, room, false)
+	return
 }
 
 // handleSetAvatar handles the "avatar set" command by extracting the avatar URL from the message body,
@@ -501,7 +568,8 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEv
 // The URL also need to point to an image that is *NOT* encrypted, as Matrix doesn't handle encrypted avatars. At least I couldn't get it to work.
 // It logs an error message if setting the avatar fails.
 func (bot *MatrixBot) handleSetAvatar(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
-	body := message.Body
+	defer cancelContext(ctx)
+	/*body := message.Body
 
 	rtrimEvent := strings.Split(body, "avatar set ")[1]
 	imgUrl := strings.Split(rtrimEvent, " ")[0]
@@ -512,11 +580,137 @@ func (bot *MatrixBot) handleSetAvatar(ctx context.Context, message *event.Messag
 		bot.Log.Error().
 			Err(err).
 			Msg("Couldn't set avatar")
+	}*/
+	_, err := bot.sendHTMLNotice(ctx, room, "<i><b>Ledsen, att byta avatar är inte implementerat just nu</b></i>", &sender)
+	if err != nil {
+		bot.Log.Warn().Err(err).Msg("Couldn't send response back to user")
 	}
+	bot.toggleTyping(ctx, room, false)
 }
 
-func (bot *MatrixBot) handleQueryTtI(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
+func (bot *MatrixBot) handleGenerateImage(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
+	defer cancelContext(ctx)
+	HandleRoomTyping(room, 1, bot)
+	defer HandleRoomTyping(room, -1, bot)
 
+	bot.Log.Debug().Msg("Handling a Generate Image query")
+	//Prepare prompt, model and if exist system prompt
+	promptText := bot.regexTrimLeft("", message.Body)
+
+	_, err := bot.sendHTMLNotice(ctx, room, "<i>Som jag har förstått det vill du få en bild genererad. "+
+		"Jag håller på med det och återkommer med bilden strax...</i>", &sender)
+
+	if err != nil {
+		bot.Log.Warn().Msg("Couldn't inform user image is being generated")
+	}
+
+	// Make the request to AI API
+	client := http.Client{
+		Timeout: time.Duration(bot.Config.AI.Timeout) * time.Minute,
+	}
+
+	data := "{\"prompt\": \"" + promptText + "\", \"inference_steps\": 50, \"guidance_scale\": 10.5}"
+	bot.Log.Debug().Any("request", data).Msg("Sending Body data ")
+	// Build searchURL string from config
+	searchURL := bot.Config.AI.Endpoints["image"].Host + ":" + string(bot.Config.AI.Endpoints["image"].Port) + "/" + bot.Config.AI.Endpoints["image"].Url
+	resp, err := client.Post(searchURL, "application/json", bytes.NewBuffer([]byte(data)))
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Error making request to Image generation API")
+		return
+	}
+	// defer closing of the body to close off HTTP session
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			bot.Log.Error().
+				Err(err).
+				Msg("An error occurred closing Body")
+			return
+		}
+	}(resp.Body)
+
+	// First we need a MXC URI from the server to upload to
+	MXCResponse, err := bot.Client.CreateMXC(ctx)
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Error getting MXC URI response")
+		return
+	}
+
+	// Create encrypted file object to hold the image
+	encryptedFile := attachment.NewEncryptedFile()
+
+	//Read image from imgData
+	encCloser := encryptedFile.EncryptStream(resp.Body)
+
+	// Save image into imgData variable
+	imgEncData, err := io.ReadAll(encCloser)
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Error reading response from encryption stream")
+		return
+	}
+	err = encCloser.Close()
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Error encrypting image")
+		return
+	}
+
+	mediaUpload := mautrix.ReqUploadMedia{
+		ContentBytes:      imgEncData,
+		ContentLength:     int64(len(imgEncData)),
+		ContentType:       "image/jpeg",
+		MXC:               MXCResponse.ContentURI,
+		UnstableUploadURL: MXCResponse.UnstableUploadURL,
+	}
+
+	_, err = bot.Client.UploadMedia(ctx, mediaUpload)
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Error uploading image to Matrix")
+		return
+	}
+
+	encFileInfo := event.EncryptedFileInfo{
+		EncryptedFile: *encryptedFile,
+		URL:           MXCResponse.ContentURI.CUString(),
+	}
+
+	content := event.MessageEventContent{
+		MsgType:       event.MsgImage,
+		Body:          "Image of: " + promptText,
+		Format:        event.FormatHTML,
+		FormattedBody: "Image of: " + promptText,
+		File:          &encFileInfo,
+		Info: &event.FileInfo{
+			MimeType: "image/jpeg",
+			Width:    1024,
+			Height:   1024,
+		},
+		URL:      MXCResponse.ContentURI.CUString(),
+		FileName: "generated.jpg",
+		Mentions: &event.Mentions{
+			UserIDs: []id.UserID{sender},
+		},
+	}
+
+	bot.Log.Debug().Any("content", content).Msg("Image content")
+
+	_, err = bot.Client.SendMessageEvent(ctx, room, event.EventMessage, content)
+	if err != nil {
+		bot.Log.Error().
+			Err(err).
+			Msg("Error sending image to Matrix")
+	}
+	bot.toggleTyping(ctx, room, false)
+	return
 }
 
 // SaveContext saves the context for a given room in the "Bot-Context" table of the database.
@@ -599,13 +793,22 @@ func (bot *MatrixBot) CancelRunningHandlers(ctx context.Context) {
 // The message format is set to FormatHTML.
 // If an error occurs while sending the message, it returns nil and the error.
 // Otherwise, it returns the response from SendMessageEvent.
-func (bot *MatrixBot) sendHTMLNotice(ctx context.Context, room id.RoomID, message string) (*mautrix.RespSendEvent, error) {
+func (bot *MatrixBot) sendHTMLNotice(ctx context.Context, room id.RoomID, message string, at *id.UserID) (*mautrix.RespSendEvent, error) {
 	plainMsg := format.HTMLToText(message)
+	var mention event.Mentions
+	if at != nil {
+		mention = event.Mentions{
+			UserIDs: []id.UserID{*at},
+		}
+	} else {
+		mention = event.Mentions{}
+	}
 	resp, err := bot.Client.SendMessageEvent(ctx, room, event.EventMessage, &event.MessageEventContent{
 		MsgType:       event.MsgNotice,
 		Body:          plainMsg,
 		FormattedBody: message,
 		Format:        event.FormatHTML,
+		Mentions:      &mention,
 	})
 	if err != nil {
 		return nil, err
@@ -629,13 +832,15 @@ func (bot *MatrixBot) toggleTyping(ctx context.Context, room id.RoomID, isTyping
 // The response is read, parsed, and returned as a map[string]interface{}.
 // The method also updates the bot's context based on the response, if available, and saves it to permanent storage.
 // Finally, it toggles the typing status and returns the full response or an error if any occurred.
-func (bot *MatrixBot) queryAI(ctx context.Context, message string, model string, room id.RoomID) (map[string]interface{}, error) {
+func (bot *MatrixBot) queryAI(ctx context.Context, message string, system string, model string, room id.RoomID) (map[string]interface{}, error) {
 	//Prepare prompt, model and if exist system prompt
 	promptText := strings.ReplaceAll(strings.ReplaceAll(strings.TrimPrefix(message, "query "), bot.Name, ""), "  ", " ")
+	prompt := fmt.Sprintf("%s\n%s\n%s\n%s", UserPromptHeader, promptText, EndOfText, AssistantPromptHeader)
 	rawQuery := NewQuery().
 		WithModel(model).
-		WithPrompt(promptText).
-		WithStream(false)
+		WithPrompt(prompt).
+		WithStream(false).
+		WithSystem(system)
 
 	queryContext, ok := Contexts[room]
 	if ok {
@@ -645,32 +850,15 @@ func (bot *MatrixBot) queryAI(ctx context.Context, message string, model string,
 	// Convert AIQuery to an io.Reader that http.Post can handle
 	requestBody := rawQuery.ToIOReader()
 
-	// Toogle the bot to be typing for 30 seconds periods before sending typing again
-	c := make(chan bool)
-	go func(c chan bool, bot *MatrixBot) {
-		for {
-			select {
-			case <-c:
-				return
-			default:
-				bot.Log.Debug().Msg("Sending typing as at least one room has asked the bot something")
-				bot.toggleTyping(ctx, room, true)
-				time.Sleep(30 * time.Second)
-			}
-		}
-	}(c, bot)
-
 	// Make the request to AI API
 	client := http.Client{
-		Timeout: 30 * time.Minute,
+		Timeout: time.Duration(bot.Config.AI.Timeout) * time.Minute,
 	}
 	bot.Log.Info().Msg("Sending question to AI, waiting...")
-	resp, err := client.Post(fmt.Sprintf("%s:%s/%s", bot.Config.AI.Host, bot.Config.AI.Port, bot.Config.AI.Endpoints["chat"].Url), "application/json", requestBody)
+	bot.Log.Debug().Msgf("Data: %s", requestBody)
+	resp, err := client.Post(fmt.Sprintf("%s:%s/%s", bot.Config.AI.Host, bot.Config.AI.Port,
+		bot.Config.AI.Endpoints["chat"].Url), "application/json", requestBody)
 	if err != nil {
-		c <- true
-		if len(runningCmds) <= 1 {
-			bot.toggleTyping(ctx, room, false)
-		}
 		bot.Log.Error().
 			Err(err).
 			Msg("Error querying AI")
@@ -689,8 +877,6 @@ func (bot *MatrixBot) queryAI(ctx context.Context, message string, model string,
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		c <- true
-		bot.toggleTyping(ctx, room, false)
 		bot.Log.Error().Err(err).Msg("Error reading answer from AI")
 		return nil, err
 	}
@@ -698,10 +884,6 @@ func (bot *MatrixBot) queryAI(ctx context.Context, message string, model string,
 	var fullResponse map[string]interface{}
 	err = json.Unmarshal(body, &fullResponse)
 	if err != nil {
-		c <- true
-		if len(runningCmds) <= 1 {
-			bot.toggleTyping(ctx, room, false)
-		}
 		bot.Log.Error().Err(err).Msg("Can't unmarshal JSON response from AI")
 		return nil, err
 	}
@@ -716,16 +898,12 @@ func (bot *MatrixBot) queryAI(ctx context.Context, message string, model string,
 	}
 	bot.Log.Debug().Msg("Updating Init Bot Context and saving to permanent storage")
 	Contexts[room] = botContext
-	err = bot.SaveContext(ctx, room)
-	if err != nil {
-		bot.Log.Warn().Err(err).Msg("Context will not survive restart")
-	}
-
-	// Toggle typing to false if we are the last ones running and then send reply
-	c <- true
-	if len(runningCmds) <= 1 {
-		bot.toggleTyping(ctx, room, false)
-	}
+	go func() {
+		err := bot.SaveContext(ctx, room)
+		if err != nil {
+			bot.Log.Warn().Err(err).Msg("Context will not survive restart")
+		}
+	}()
 
 	return fullResponse, nil
 }
@@ -739,6 +917,79 @@ func (bot *MatrixBot) queryAI(ctx context.Context, message string, model string,
 // Returns:
 // - the trimmed string
 func (bot *MatrixBot) regexTrimLeft(needle string, haystack string) string {
-	matchRegex := regexp.MustCompile("^.*(" + bot.Name + ").*" + needle + " *")
+	matchRegex := regexp.MustCompile("^.*" + bot.Name + "[,:.]* ")
 	return strings.TrimSpace(string(matchRegex.ReplaceAll([]byte(haystack), []byte(""))))
+}
+
+func (bot *MatrixBot) qualifySearch(documents []string, userPrompt string, criteria string) []int {
+	qualifyURL := bot.Config.AI.Endpoints["qualify"].Host + ":" + string(bot.Config.AI.Endpoints["qualify"].Port) + "/" + bot.Config.AI.Endpoints["qualify"].Url
+	var approvedDocs = make([]int, 0, len(documents))
+	client := http.Client{
+		Timeout: time.Duration(bot.Config.AI.Timeout) * time.Minute,
+	}
+	// Empty context
+	_, err := client.Post(qualifyURL, "application/json", strings.NewReader(""))
+	if err != nil {
+		bot.Log.Error().Err(err).Msg("Error emptying context for qualify url")
+		return approvedDocs
+	}
+	for index, doc := range documents {
+		msg := NewQuery().
+			WithModel(strings.ToValidUTF8(bot.Config.AI.Endpoints["qualify"].Model, "")).
+			WithStream(false).
+			WithSystem(criteria).
+			WithPrompt(fmt.Sprintf("Here is the retreived document: \n %s \n\n Here is the user question: %s", doc, userPrompt))
+		query := msg.ToIOReader()
+		bot.Log.Debug().Any("query", query).Msg("Qualify query")
+		resp, ierr := client.Post(qualifyURL, "application/json", query)
+		if ierr != nil {
+			bot.Log.Warn().Err(ierr).Msg("Couldn't get response from qualify")
+			continue
+		}
+
+		// Check if the response status code is not 200
+		if resp.StatusCode != http.StatusOK {
+			bot.Log.Error().Msgf("Qualify API returned non-200 status code: %d", resp.StatusCode)
+			continue
+		}
+
+		body, ierr := io.ReadAll(resp.Body)
+		if ierr != nil {
+			bot.Log.Error().Err(ierr).Msg("Couldn't read response from qualify")
+			continue
+		}
+		bot.Log.Debug().Str(string(rune(index)), string(body)).Msg("Got response from qualify")
+
+		var respInterf map[string]interface{}
+		ierr = json.Unmarshal(body, &respInterf)
+		if ierr != nil {
+			bot.Log.Error().Err(ierr).Msg("Couldn't unmarshal response from qualify")
+		}
+
+		bot.Log.Debug().Msgf("Response is: %s", respInterf["response"])
+		respJSON := respInterf["response"].(string)
+		respJSONBytes := []byte(respJSON)
+		var respStruct map[string]string
+		ierr = json.Unmarshal(respJSONBytes, &respStruct)
+		if ierr != nil {
+			bot.Log.Error().Err(ierr).Msg("Couldn't unmarshal response from qualify inner JSON")
+		}
+		bot.Log.Debug().Msgf("Response object is: %v", respStruct)
+		score, ok := respStruct["score"]
+		if !ok {
+			bot.Log.Error().Msg("Couldn't get response score key")
+			continue
+		}
+		bot.Log.Debug().Msgf("Score is: %s", score)
+		if score == "yes" {
+			approvedDocs = append(approvedDocs, index)
+		}
+
+		ierr = resp.Body.Close()
+		if ierr != nil {
+			bot.Log.Error().Err(ierr).Msg("An error occurred closing response body")
+		}
+	}
+
+	return approvedDocs
 }
