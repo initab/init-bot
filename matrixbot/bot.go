@@ -461,7 +461,7 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEv
 
 	bot.Log.Debug().Msg("Handling a Search query")
 	//Prepare prompt, model and if exist system prompt
-	promptText := bot.regexTrimLeft("", message.Body)
+	promptText := bot.regexTrimLeft(message.Body)
 
 	client := http.Client{
 		Timeout: time.Duration(bot.Config.AI.Timeout) * time.Minute,
@@ -566,7 +566,7 @@ func (bot *MatrixBot) handleGenerateImage(ctx context.Context, message *event.Me
 
 	bot.Log.Debug().Msg("Handling a Generate Image query")
 	//Prepare prompt, model and if exist system prompt
-	promptText := bot.regexTrimLeft("", message.Body)
+	promptText := bot.regexTrimLeft(message.Body)
 
 	_, err := bot.sendHTMLNotice(ctx, room, "<i>Som jag har förstått det vill du få en bild genererad. "+
 		"Jag håller på med det och återkommer med bilden strax...</i>", &sender)
@@ -887,7 +887,7 @@ func (bot *MatrixBot) queryAI(ctx context.Context, message string, system string
 // - haystack: the string to trim from the left side
 // Returns:
 // - the trimmed string
-func (bot *MatrixBot) regexTrimLeft(needle string, haystack string) string {
+func (bot *MatrixBot) regexTrimLeft(haystack string) string {
 	matchRegex := regexp.MustCompile("^.*" + bot.Name + "[,:.]* ")
 	return strings.TrimSpace(string(matchRegex.ReplaceAll([]byte(haystack), []byte(""))))
 }
