@@ -559,6 +559,11 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEv
 	return
 }
 
+// handleGenerateImage handles a request to generate an image based on a prompt text.
+// It sends a notice message to the user indicating that the image is being generated.
+// Then, it makes a request to the AI API with the prompt text and receives the generated image.
+// The image is encrypted and uploaded to the Matrix server using the client's media upload endpoint.
+// Finally, it sends a message event containing the generated image to the specified room.
 func (bot *MatrixBot) handleGenerateImage(ctx context.Context, message *event.MessageEventContent, room id.RoomID, sender id.UserID) {
 	defer cancelContext(ctx)
 	HandleRoomTyping(room, 1, bot)
