@@ -7,25 +7,39 @@
     "db": {
         "host": "localhost",
         "port": 5432,
-        "user": "postgres",
+        "user": "",
         "password": "",
         "db_name": "bot"
     },
     "ai": {
         "host": "http://localhost",
         "port": 11434,
+        "classification_threshold": 0.85,
+        "timeout": 5,
         "endpoints": {
             "chat": {
                 "url": "api/generate",
-                "model": "llama2"
-            },
-            "instruct": {
-                "url": "api/generate",
-                "model": "llama2"
+                "model": "llama3",
+                "response_key": "response"
             },
             "image": {
-                "url": "api/generate",
-                "model": "stable-diffusion"
+                "port": 8082,
+                "url": "api/generate_image"
+            },
+            "classify": {
+                "port": 8081,
+                "url": "api/classify"
+            },
+            "search": {
+                "port": 8080,
+                "url": "api/search",
+                "response_key": "Not used, use 'chat'",
+                "num_results": 15
+            },
+            "rank": {
+                "port": 8083,
+                "url": "api/rank",
+                "threshold": 0.51
             }
         }
     }

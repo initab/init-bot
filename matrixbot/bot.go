@@ -71,13 +71,19 @@ var RoomsWithTyping = make(map[id.RoomID]int)
 // RoomChannel is a map that stores a boolean channel for each room in the system.
 var RoomChannel = make(map[id.RoomID]chan bool)
 
-// Headers
+// EndOfText represents the end marker in the prompt for the queryAI function.
 const EndOfText = "<|eot_id|>"
 
+// HeaderStart is a constant that represents the starting string for a header in an AI prompt.
 const HeaderStart = "<|start_header_id|>"
+
+// HeaderEnd is a constant that represents the ending string for a header in an AI prompt.
 const HeaderEnd = "<|end_header_id|>"
 
+// UserPromptHeader is a formatted string that represents the header for a user prompt in an AI conversation. It combines the HeaderStart and HeaderEnd constants.
 var UserPromptHeader = fmt.Sprintf("%suser%s%", HeaderStart, HeaderEnd)
+
+// AssistantPromptHeader is a string variable that represents the header for an assistant prompt.
 var AssistantPromptHeader = fmt.Sprintf("%sassistant%s%", HeaderStart, HeaderEnd)
 
 // cancelContext cancels the context and removes it from the runningCmds map.
@@ -95,6 +101,17 @@ func cancelContext(ctx context.Context) bool {
 	return true
 }
 
+// HandleRoomTyping handles the typing status of a specific room.
+// It takes the room ID, a counter value, and a MatrixBot pointer as parameters.
+// It retrieves the current counter value for the specified room from the RoomsWithTyping map.
+// It then adds the new counter value to the old counter value and checks if it was the first or last workload in that room.
+// The new counter value is logged using the MatrixBot's Debug logger.
+// If the new counter value is less than 0, it is set to 0.
+// If the new counter value is 1, it means a typing activity is starting in the room.
+// A new channel is created for the room and a goroutine is started to handle the typing activity.
+// If the new counter value is 0, it means the typing activity has ended in the room.
+// The value "true" is sent to the channel associated with the room and the channel is deleted.
+// Finally, the new counter value is updated in the RoomsWithTyping map.
 func HandleRoomTyping(room id.RoomID, counter int, bot *MatrixBot) {
 	var roomCount = 0
 	roomCount = RoomsWithTyping[room]
@@ -118,6 +135,11 @@ func HandleRoomTyping(room id.RoomID, counter int, bot *MatrixBot) {
 	RoomsWithTyping[room] = newCount
 }
 
+// startTyping toggles the typing state of the bot in a specific room.
+// It continues to send typing notifications until a signal is received on the channel 'c'.
+// If the signal is received, it stops sending typing notifications and returns.
+// It sleeps for 30 seconds between sending each typing notification.
+// It logs a message when it starts and stops sending typing notifications.
 func startTyping(ctx context.Context, room id.RoomID, c chan bool, bot *MatrixBot) {
 	// Toogle the bot to be typing for 30 seconds periods before sending typing again
 	for {
@@ -437,7 +459,7 @@ func (bot *MatrixBot) handleQueryAI(ctx context.Context, message *event.MessageE
 		return
 	}
 
-	bot.Log.Debug().Any("response", response).Msg("AI response")
+	//bot.Log.Debug().Any("response", response).Msg("AI response")
 
 	// We have the data, formulate a reply
 	_, err = bot.sendHTMLNotice(ctx, room, response[bot.Config.AI.Endpoints["chat"].ResponseKey].(string), &sender)
@@ -495,34 +517,24 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEv
 		return
 	}
 
-	bot.Log.Debug().Any("response", body).Msg("Response body")
-	strBody := string(body)
-
-	bot.Log.Debug().Any("strBody", strBody).Msg("Response body string")
-
 	var fullResponse types.VectorResponse
-	err = json.Unmarshal([]byte(strBody), &fullResponse)
+	err = json.Unmarshal(body, &fullResponse)
 	if err != nil {
 		bot.Log.Error().Err(err).Msg("Can't unmarshal JSON response from Vector search")
 		return
 	}
 
-	criteria := "You are a grader assessing relevance of a retrieved document to a user question. \n" +
-		"If the document is factually relevant to the user question, grade it as relevant. \n" +
-		"It does not need to be a stringent test. The goal is to filter out erroneous retrievals. \n" +
-		"Give a binary score 'yes' or 'no' to indicate whether the document is relevant to the questions \n " +
-		"Provide the binary score as a JSON with a single key 'score' and no preamble or explanation."
-
 	bot.Log.Debug().Msg("Qualifying docs")
-	qualifiedDocs := bot.qualifySearch(fullResponse.Documents, promptText, criteria)
+	qualifiedDocs := bot.qualifySearch(fullResponse.Documents, promptText)
 	bot.Log.Debug().Msgf("Index of qualified docs: %v", qualifiedDocs)
 
 	var documents string
 	for _, docIndex := range qualifiedDocs {
 		documents = documents + "; \n" + fullResponse.Documents[docIndex]
+		bot.Log.Debug().Msgf("Document index: %v, Titel: %s", docIndex, fullResponse.Metadata[docIndex]["title"])
 	}
 
-	promptAI := fmt.Sprintf("Use this data:\n%s\n To answer this question: %s",
+	promptAI := fmt.Sprintf("Använd denna data:\n%s\n För att svara på denna fråga: %s",
 		documents, promptText)
 
 	response, err := bot.queryAI(ctx, promptAI, "", bot.Config.AI.Endpoints["chat"].Model, room)
@@ -831,7 +843,7 @@ func (bot *MatrixBot) queryAI(ctx context.Context, message string, system string
 		Timeout: time.Duration(bot.Config.AI.Timeout) * time.Minute,
 	}
 	bot.Log.Info().Msg("Sending question to AI, waiting...")
-	bot.Log.Debug().Msgf("Data: %s", requestBody)
+	//bot.Log.Debug().Msgf("Data: %s", requestBody)
 	resp, err := client.Post(fmt.Sprintf("%s:%s/%s", bot.Config.AI.Host, bot.Config.AI.Port,
 		bot.Config.AI.Endpoints["chat"].Url), "application/json", requestBody)
 	if err != nil {
@@ -897,75 +909,67 @@ func (bot *MatrixBot) regexTrimLeft(haystack string) string {
 	return strings.TrimSpace(string(matchRegex.ReplaceAll([]byte(haystack), []byte(""))))
 }
 
-func (bot *MatrixBot) qualifySearch(documents []string, userPrompt string, criteria string) []int {
-	qualifyURL := bot.Config.AI.Endpoints["qualify"].Host + ":" + string(bot.Config.AI.Endpoints["qualify"].Port) + "/" + bot.Config.AI.Endpoints["qualify"].Url
+// qualifySearch sends a POST request to the rankURL with a payload containing the list of documents and user prompt.
+// It checks the response status code and reads the response body.
+// If the response status code is not 200, it logs an error message and returns an empty approvedDocs slice.
+// It then unmarshals the response body into a slice of types.Rank structs and closes the response body.
+// For each rank in the respRank slice, it logs the document ID and score, and if the score is greater than 0.0,
+// it appends the document ID to the approvedDocs slice. Finally, it returns the approvedDocs slice.
+func (bot *MatrixBot) qualifySearch(documents []string, userPrompt string) []int {
+	rankURL := bot.Config.AI.Endpoints["rank"].Host + ":" + string(bot.Config.AI.Endpoints["rank"].Port) + "/" + bot.Config.AI.Endpoints["rank"].Url
 	var approvedDocs = make([]int, 0, len(documents))
 	client := http.Client{
 		Timeout: time.Duration(bot.Config.AI.Timeout) * time.Minute,
 	}
 	// Empty context
-	_, err := client.Post(qualifyURL, "application/json", strings.NewReader(""))
+	_, err := client.Post(rankURL, "application/json", strings.NewReader(""))
 	if err != nil {
 		bot.Log.Error().Err(err).Msg("Error emptying context for qualify url")
 		return approvedDocs
 	}
-	for index, doc := range documents {
-		msg := NewQuery().
-			WithModel(strings.ToValidUTF8(bot.Config.AI.Endpoints["qualify"].Model, "")).
-			WithStream(false).
-			WithSystem(criteria).
-			WithPrompt(fmt.Sprintf("Here is the retreived document: \n %s \n\n Here is the user question: %s", doc, userPrompt))
-		query := msg.ToIOReader()
-		bot.Log.Debug().Any("query", query).Msg("Qualify query")
-		resp, ierr := client.Post(qualifyURL, "application/json", query)
-		if ierr != nil {
-			bot.Log.Warn().Err(ierr).Msg("Couldn't get response from qualify")
-			continue
-		}
-
-		// Check if the response status code is not 200
-		if resp.StatusCode != http.StatusOK {
-			bot.Log.Error().Msgf("Qualify API returned non-200 status code: %d", resp.StatusCode)
-			continue
-		}
-
-		body, ierr := io.ReadAll(resp.Body)
-		if ierr != nil {
-			bot.Log.Error().Err(ierr).Msg("Couldn't read response from qualify")
-			continue
-		}
-		bot.Log.Debug().Str(string(rune(index)), string(body)).Msg("Got response from qualify")
-
-		var respInterf map[string]interface{}
-		ierr = json.Unmarshal(body, &respInterf)
-		if ierr != nil {
-			bot.Log.Error().Err(ierr).Msg("Couldn't unmarshal response from qualify")
-		}
-
-		bot.Log.Debug().Msgf("Response is: %s", respInterf["response"])
-		respJSON := respInterf["response"].(string)
-		respJSONBytes := []byte(respJSON)
-		var respStruct map[string]string
-		ierr = json.Unmarshal(respJSONBytes, &respStruct)
-		if ierr != nil {
-			bot.Log.Error().Err(ierr).Msg("Couldn't unmarshal response from qualify inner JSON")
-		}
-		bot.Log.Debug().Msgf("Response object is: %v", respStruct)
-		score, ok := respStruct["score"]
-		if !ok {
-			bot.Log.Error().Msg("Couldn't get response score key")
-			continue
-		}
-		bot.Log.Debug().Msgf("Score is: %s", score)
-		if score == "yes" {
-			approvedDocs = append(approvedDocs, index)
-		}
-
-		ierr = resp.Body.Close()
-		if ierr != nil {
-			bot.Log.Error().Err(ierr).Msg("An error occurred closing response body")
-		}
+	payload, err := json.Marshal(map[string]interface{}{
+		"documents": documents,
+		"question":  userPrompt,
+	})
+	if err != nil {
+		bot.Log.Error().Err(err).Msg("Error marshaling qualify payload")
+		return make([]int, 0)
+	}
+	resp, ierr := client.Post(rankURL, "application/json", bytes.NewBuffer(payload))
+	if ierr != nil {
+		bot.Log.Warn().Err(ierr).Msg("Couldn't get response from qualify")
+		return make([]int, 0)
 	}
 
+	// Check if the response status code is not 200
+	if resp.StatusCode != http.StatusOK {
+		bot.Log.Error().Msgf("Qualify API returned non-200 status code: %d", resp.StatusCode)
+		return make([]int, 0)
+	}
+
+	body, ierr := io.ReadAll(resp.Body)
+	if ierr != nil {
+		bot.Log.Error().Err(ierr).Msg("Couldn't read response from qualify")
+		return make([]int, 0)
+	}
+
+	var respRank []types.Rank
+	ierr = json.Unmarshal(body, &respRank)
+	if ierr != nil {
+		bot.Log.Error().Err(ierr).Msg("Couldn't unmarshal response from qualify")
+	}
+
+	err = resp.Body.Close()
+	if err != nil {
+		return make([]int, 0)
+	}
+
+	for _, rank := range respRank {
+		score, _ := rank.Score.Float64()
+		bot.Log.Debug().Msgf("Document ID: %d, Document score: %f", int(rank.CorpusId), score)
+		if score > bot.Config.AI.Endpoints["rank"].Threshold {
+			approvedDocs = append(approvedDocs, int(rank.CorpusId))
+		}
+	}
 	return approvedDocs
 }

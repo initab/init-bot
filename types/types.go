@@ -37,6 +37,7 @@ type Endpoint struct {
 	Port        json.Number `json:"port,omitempty"`
 	ResponseKey string      `json:"response_key,omitempty"`
 	NumResults  json.Number `json:"num_results,omitempty"`
+	Threshold   float64     `json:"threshold,omitempty"`
 }
 
 type VectorResponse struct {
@@ -50,4 +51,9 @@ type TopicClassifications struct {
 	Sequence string    `json:"sequence"`
 	Labels   []string  `json:"labels"`
 	Scores   []float64 `json:"scores"`
+}
+
+type Rank struct {
+	CorpusId int64       `json:"corpus_id"`
+	Score    json.Number `json:"score"`
 }
