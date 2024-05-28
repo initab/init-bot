@@ -844,8 +844,9 @@ func (bot *MatrixBot) queryAI(ctx context.Context, message string, system string
 	}
 	bot.Log.Info().Msg("Sending question to AI, waiting...")
 	//bot.Log.Debug().Msgf("Data: %s", requestBody)
-	resp, err := client.Post(fmt.Sprintf("%s:%s/%s", bot.Config.AI.Host, bot.Config.AI.Port,
-		bot.Config.AI.Endpoints["chat"].Url), "application/json", requestBody)
+	resp, err := client.Post(fmt.Sprintf("%s:%s/%s", bot.Config.AI.Endpoints["chat"].Host,
+		bot.Config.AI.Endpoints["chat"].Port, bot.Config.AI.Endpoints["chat"].Url),
+		"application/json", requestBody)
 	if err != nil {
 		bot.Log.Error().
 			Err(err).
