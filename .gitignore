@@ -2,3 +2,4 @@
 init-bot*
 config.json
 builds/*
+.idea
