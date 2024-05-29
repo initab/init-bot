@@ -9,7 +9,10 @@ message, and replies to the room from where the message originated.
 * Image generator
 
 The AI backend is configurable in the config.json file and not part of the bot itself. This bot only acts as the
-intermediate layer between the AI models and the Matrix server
+intermediate layer between the AI models and the Matrix server. 
+
+**N.B.!** Currently, it is assumed that the AI backend runs in a safe environment and does not need any authorization.
+This is something planned to be fixed in the future.
 
 ### Secondary functions
 * Keep track of the context per room in a Postgres database.
