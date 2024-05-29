@@ -8,6 +8,9 @@ message, and replies to the room from where the message originated.
 * RAG enabled Document search
 * Image generator
 
+The AI backend is configurable in the config.json file and not part of the bot itself. This bot only acts as the
+intermediate layer between the AI models and the Matrix server
+
 ### Secondary functions
 * Keep track of the context per room in a Postgres database.
 * Sends typing notifications while the AI is generating responses.
