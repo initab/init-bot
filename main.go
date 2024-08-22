@@ -65,7 +65,7 @@ func main() {
 
 	flag.Parse()
 
-	// Read configuration from file
+	// Read configuration from the config file
 	jsonFile, err := os.Open(*configFile)
 	if err != nil {
 		log.Error().
@@ -137,7 +137,7 @@ func main() {
 	// If the host, port, num_results or response key of an endpoint is not provided,
 	// it assigns them default values from the main AI config or default values. This ensures
 	// that all endpoints have these necessary properties set. Some endpoints won't use them.
-	// but that is a different matter.
+	// But that is a different matter.
 	for k, v := range config.AI.Endpoints {
 		if v.Host == "" {
 			v.Host = config.AI.Host
@@ -150,9 +150,7 @@ func main() {
 		}
 
 		if v.NumResults == "" {
-			if v.NumResults == "" {
-				v.NumResults = "10"
-			}
+			v.NumResults = "10"
 		}
 		config.AI.Endpoints[k] = v
 	}

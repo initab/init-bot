@@ -295,8 +295,12 @@ func NewMatrixBot(config types.Config, log *zerolog.Logger) (*MatrixBot, error) 
 	bot.Config = config
 
 	// Register the commands this bot should handle
-	bot.RegisterCommand("sökning", 0, "Start message with 'search' to search SharePoint documents", bot.handleSearch)
-	bot.RegisterCommand("bildgenerering", 0, "Generate an image via AI and send to the Matrix Chat Room", bot.handleGenerateImage)
+	if config.AI.Endpoints["search"].Use {
+		bot.RegisterCommand("sökning", 0, "Start message with 'search' to search SharePoint documents", bot.handleSearch)
+	}
+	if config.AI.Endpoints["image"].Use {
+		bot.RegisterCommand("bildgenerering", 0, "Generate an image via AI and send to the Matrix Chat Room", bot.handleGenerateImage)
+	}
 	bot.RegisterCommand("", 0, "Default action is to Query the AI", bot.handleQueryAI)
 
 	return bot, nil
@@ -482,7 +486,7 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEv
 	defer HandleRoomTyping(room, -1, bot)
 
 	bot.Log.Debug().Msg("Handling a Search query")
-	//Prepare prompt, model and if exist system prompt
+	//Prepare prompt, model, and if it exists, system prompt
 	promptText := bot.regexTrimLeft(message.Body)
 
 	client := http.Client{
@@ -524,13 +528,22 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEv
 		return
 	}
 
-	bot.Log.Debug().Msg("Qualifying docs")
-	qualifiedDocs := bot.qualifySearch(fullResponse.Documents, promptText)
+	var qualifiedDocs []int
+	if bot.Config.AI.Endpoints["rank"].Use {
+		bot.Log.Debug().Msg("Qualifying docs")
+		qualifiedDocs = bot.qualifySearch(fullResponse.Documents, promptText)
+	} else {
+		bot.Log.Debug().Msg("NOT Qualifying docs, all will be returned")
+		qualifiedDocs = make([]int, 0, len(fullResponse.Documents))
+		for i := range qualifiedDocs {
+			qualifiedDocs[i] = i
+		}
+	}
 	bot.Log.Debug().Msgf("Index of qualified docs: %v", qualifiedDocs)
 
 	var documents string
 	for _, docIndex := range qualifiedDocs {
-		documents = documents + "; \n" + fullResponse.Documents[docIndex]
+		documents = documents + "\n\n" + fullResponse.Documents[docIndex]
 		bot.Log.Debug().Msgf("Document index: %v, Titel: %s", docIndex, fullResponse.Metadata[docIndex]["title"])
 	}
 

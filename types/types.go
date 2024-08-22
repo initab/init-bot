@@ -38,6 +38,7 @@ type Endpoint struct {
 	ResponseKey string      `json:"response_key,omitempty"`
 	NumResults  json.Number `json:"num_results,omitempty"`
 	Threshold   float64     `json:"threshold,omitempty"`
+	Use         bool        `json:"use,omitempty"`
 }
 
 type VectorResponse struct {
