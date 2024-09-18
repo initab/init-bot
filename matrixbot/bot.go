@@ -3,19 +3,28 @@ package matrixbot
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/jackc/pgx/v5"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
+	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
+	"init-bot/memory"
 	"init-bot/types"
 	"io"
+	"math/rand"
 	"maunium.net/go/mautrix/crypto/attachment"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -62,8 +71,8 @@ type CommandHandler struct {
 
 var runningCmds = make(map[context.Context]*context.CancelFunc)
 
-// Contexts is a map that stores the context values for each room in the bot.
-var Contexts = make(map[id.RoomID][]int)
+// Handler is what handles the context (Short term memory) for the AI associated with the bot.
+var Handler *memory.Handler
 
 // RoomsWithTyping is a map that stores the typing status for each room in the bot.
 var RoomsWithTyping = make(map[id.RoomID]int)
@@ -234,7 +243,7 @@ func NewMatrixBot(config types.Config, log *zerolog.Logger) (*MatrixBot, error) 
 	// Log that we have started up and started listening
 	log.Info().Msg("Now running")
 
-	log.Info().Msg("Setting up DB and Contexts")
+	log.Info().Msg("Setting up DB and Handler")
 	bot.Database, err = pgxpool.New(syncCtx, fmt.Sprintf("postgres://%s:%s@%s:%s/%s", config.DB.User, config.DB.Password, config.DB.Host, config.DB.Port, config.DB.DBName))
 	if err != nil {
 		bot.Log.Error().
@@ -242,53 +251,49 @@ func NewMatrixBot(config types.Config, log *zerolog.Logger) (*MatrixBot, error) 
 			Msg("Error Creating DB Pool")
 	}
 
-	db, err := bot.Database.Acquire(syncCtx)
-	if err != nil {
-		bot.Log.Warn().
-			Err(err).
-			Msg("Error connecting to Database")
+	// Setup Context (Memory) Handler for bot
+	if config.ContextHandler == memory.TokenHandler {
+		Handler = memory.NewTokenHandler(syncCtx, bot.Database, *log)
+	} else if config.ContextHandler == memory.MessageHandler {
+		Handler = memory.NewMessageHandler(syncCtx, bot.Database, *log)
+	} else {
+		log.Error().Msg("Unsupported context handler. Will quit as Context can't be handled")
+		syscall.Exit(3)
 	}
-
-	// Taken from StackOverflow as how to actually check for Real Tables that the user can access
-	rows, _ := db.Query(syncCtx, "SELECT EXISTS (SELECT FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE  n.nspname = $1 AND c.relname = $2 AND c.relkind = 'r');", "public", "Bot-Context")
-	defer rows.Close()
-	bools, err := pgx.CollectRows(rows, pgx.RowTo[bool])
-	rows.Close()
-
-	// If the table doesn't exist in the database we create it. This is where the Bots "memory" will be stored in the form of LLM Tokens that makes up the LLM Context (Different from the Background Context used for all functions in this code)
-	if !bools[0] {
-		_, err := db.Exec(syncCtx, "CREATE TABLE \"Bot-Context\" (room text PRIMARY KEY, context integer ARRAY)")
-		if err != nil {
-			bot.Log.Error().
-				Err(err).
-				Msg("Error creating Bot-Context table")
-		}
+	if err := Handler.SetupDatabase(); err != nil {
+		bot.Log.Error().Err(err).Msg("Error setting up database for Context Handler. Context will not be saved!")
 	}
-
 	// Retrieve all rooms from the database
-	rows, err = db.Query(syncCtx, "SELECT * FROM \"Bot-Context\"")
-	if err != nil {
-		bot.Log.Error().Err(err).Msg("Error retrieving rooms from the database")
-	}
-	defer rows.Close()
-	// Iterate over each row and update the Contexts variable
-	for rows.Next() {
-		var roomID string
-		var roomContext []int
-
-		err = rows.Scan(&roomID, &roomContext)
+	var db *pgxpool.Conn
+	if db, err = bot.Database.Acquire(syncCtx); err != nil {
+		bot.Log.Error().Err(err).Msg("Error acquiring database connection. Context will not be loaded from DB")
+	} else {
+		defer db.Release()
+		rows, err := db.Query(syncCtx, "SELECT room FROM \"Bot-Context\"")
 		if err != nil {
-			bot.Log.Error().
-				Err(err).
-				Msg("Error reading all room contexts from the database")
+			bot.Log.Error().Err(err).Msg("Error retrieving rooms from the database")
 		}
+		// Make sure rows are closed no matter what happens
+		defer rows.Close()
+		// Iterate over each row and update the Handler variable
+		for rows.Next() {
+			var roomID string
 
-		// Use the room column as key to Contexts variable and save the roomContext column
-		Contexts[id.RoomID(roomID)] = roomContext
-		RoomsWithTyping[id.RoomID(roomID)] = 0
+			err = rows.Scan(&roomID)
+			if err != nil {
+				bot.Log.Error().
+					Err(err).
+					Msg("Error reading all room contexts from the database")
+			}
+
+			// Use the room column as key to Handler variable and save the roomContext column
+			if err = Handler.LoadContext(id.RoomID(roomID)); err != nil {
+				bot.Log.Error().Err(err).Msg("Error loading context from DB")
+			}
+			RoomsWithTyping[id.RoomID(roomID)] = 0
+		}
+		rows.Close()
 	}
-	rows.Close()
-
 	db.Release()
 
 	// Set bots Config to use the config provided by the user
@@ -346,9 +351,6 @@ func (bot *MatrixBot) handleCommands(ctx context.Context, message *event.Message
 		Str("user_message", matchMessage).
 		Msg("Message from the user")
 
-	bot.Log.Debug().
-		Any("RunnningCMDs", runningCmds).
-		Msg("Running CMDs")
 	// Make the request to AI API
 	client := http.Client{
 		Timeout: time.Duration(bot.Config.AI.Timeout) * time.Minute,
@@ -370,7 +372,15 @@ func (bot *MatrixBot) handleCommands(ctx context.Context, message *event.Message
 	bot.Log.Debug().Any("request", data).Msg("Sending Body data")
 	// Build the URL to Classify AI from config
 	classifyURL := bot.Config.AI.Endpoints["classify"].Host + ":" + string(bot.Config.AI.Endpoints["classify"].Port) + "/" + bot.Config.AI.Endpoints["classify"].Url
-	resp, err := client.Post(classifyURL, "application/json", bytes.NewBuffer([]byte(data)))
+	//req, err := http.NewRequest(http.MethodPost, classifyURL, bytes.NewBuffer([]byte(data)))
+	req, err := signAPIRequest(ctx, data, classifyURL, bot.Log)
+	if err != nil {
+		bot.Log.Error().Err(err).Msg("Error signing request with AWS SigV4")
+		cancelContext(ctx)
+		return
+	}
+	req.Header.Add("Content-Type", "application/json")
+	resp, err := client.Do(req)
 	if err != nil {
 		bot.Log.Error().Err(err).Msg("Error making request to Topic Classification API")
 		cancelContext(ctx)
@@ -466,7 +476,7 @@ func (bot *MatrixBot) handleQueryAI(ctx context.Context, message *event.MessageE
 	//bot.Log.Debug().Any("response", response).Msg("AI response")
 
 	// We have the data, formulate a reply
-	_, err = bot.sendHTMLNotice(ctx, room, response[bot.Config.AI.Endpoints["chat"].ResponseKey].(string), &sender)
+	_, err = bot.sendHTMLNotice(ctx, room, response.Content[0].Text, &sender)
 	if err != nil {
 		bot.Log.Error().
 			Err(err).
@@ -497,7 +507,15 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEv
 	bot.Log.Debug().Any("request", data).Msg("Sending Body data")
 	// Build searchURL string from config
 	searchURL := bot.Config.AI.Endpoints["search"].Host + ":" + string(bot.Config.AI.Endpoints["search"].Port) + "/" + bot.Config.AI.Endpoints["search"].Url
-	resp, err := client.Post(searchURL, "application/json", bytes.NewBuffer([]byte(data)))
+
+	req, err := signAPIRequest(ctx, data, searchURL, bot.Log)
+	if err != nil {
+		bot.Log.Error().Err(err).Msg("Couldn't sign API request with AWS SigV4")
+		return
+	}
+	req.Header.Add("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		bot.Log.Error().Err(err).Msg("Error making request to Vector Search API")
 		return
@@ -534,16 +552,43 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEv
 		qualifiedDocs = bot.qualifySearch(fullResponse.Documents, promptText)
 	} else {
 		bot.Log.Debug().Msg("NOT Qualifying docs, all will be returned")
-		qualifiedDocs = make([]int, 0, len(fullResponse.Documents))
-		for i := range qualifiedDocs {
-			qualifiedDocs[i] = i
+		numResults, _ := bot.Config.AI.Endpoints["search"].NumResults.Int64()
+		currI := 0
+		for i := range fullResponse.IDs {
+			bot.Log.Debug().Msgf("Result number: %v", currI)
+			if currI >= int(numResults) {
+				break
+			} else {
+				currI++
+			}
+			bot.Log.Debug().Msgf("Adding document: %v", i)
+			qualifiedDocs = append(qualifiedDocs, i)
+			bot.Log.Debug().Msgf("Qualified docs: %v", qualifiedDocs)
 		}
 	}
 	bot.Log.Debug().Msgf("Index of qualified docs: %v", qualifiedDocs)
-
+	// Look at the character limit, then remove the user question that has to be included
+	charactersRemaining := bot.Config.AI.Endpoints["chat"].CharLimit
+	charactersRemaining -= len(promptText)
+	// Then take the remaining number of characters available and halve it, this half is for information.
+	// The other half is for Conversation Context
+	characterThreshold := charactersRemaining / 2
 	var documents string
+	var urls = make(map[string]bool)
+	metadata := "\n\n_**Metadata:**_\n"
 	for _, docIndex := range qualifiedDocs {
+		if charactersRemaining-len(fullResponse.Documents[docIndex]) < characterThreshold {
+			break
+		}
+		charactersRemaining -= len(fullResponse.Documents[docIndex])
+
 		documents = documents + "\n\n" + fullResponse.Documents[docIndex]
+		meta := fullResponse.Metadata[docIndex]
+		for key, value := range meta {
+			if key == "url" {
+				urls[value.(string)] = true
+			}
+		}
 		bot.Log.Debug().Msgf("Document index: %v, Titel: %s", docIndex, fullResponse.Metadata[docIndex]["title"])
 	}
 
@@ -553,24 +598,20 @@ func (bot *MatrixBot) handleSearch(ctx context.Context, message *event.MessageEv
 	response, err := bot.queryAI(ctx, promptAI, "", bot.Config.AI.Endpoints["chat"].Model, room)
 	if err != nil {
 		bot.Log.Error().Err(err).Msg("Error using Search response in AI query")
-	}
-
-	var urls = make(map[string]bool)
-	metadata := "\n\n_**Metadata:**_\n"
-	for _, docIndex := range qualifiedDocs {
-		meta := fullResponse.Metadata[docIndex]
-		for key, value := range meta {
-			if key == "url" {
-				urls[value.(string)] = true
-			}
+		_, err := bot.sendHTMLNotice(ctx, room, "Fel inträffade när Vektorsöknings svaret skulle inhämtas", &sender)
+		if err != nil {
+			bot.Log.Error().
+				Err(err).
+				Msg("Couldn't send response back to user")
 		}
+		return
 	}
 
 	for url := range urls {
 		metadata += fmt.Sprintf("url: %v\n", url)
 	}
 
-	reply := response[bot.Config.AI.Endpoints["chat"].ResponseKey].(string) + metadata
+	reply := response.Content[0].Text + metadata
 	// We have the data, formulate a reply
 	replyMessage := format.RenderMarkdown(reply, true, true)
 	_, err = bot.sendHTMLNotice(ctx, room, replyMessage.FormattedBody, &sender)
@@ -606,31 +647,71 @@ func (bot *MatrixBot) handleGenerateImage(ctx context.Context, message *event.Me
 	}
 
 	// Make the request to AI API
-	client := http.Client{
-		Timeout: time.Duration(bot.Config.AI.Timeout) * time.Minute,
-	}
+	//client := http.Client{
+	//	Timeout: time.Duration(bot.Config.AI.Timeout) * time.Minute,
+	//}
+	body, err := json.Marshal(types.TitanImageRequest{
+		TaskType: "TEXT_IMAGE",
+		TextToImageParams: types.TextToImageParams{
+			Text: promptText,
+		},
+		ImageGenerationConfig: types.ImageGenerationConfig{
+			NumberOfImages: 1,
+			Quality:        "standard",
+			CfgScale:       8.0,
+			Height:         512,
+			Width:          512,
+			Seed:           int64(rand.Intn(2147483646)),
+		},
+	})
 
-	data := "{\"prompt\": \"" + promptText + "\", \"inference_steps\": 50, \"guidance_scale\": 10.5}"
-	bot.Log.Debug().Any("request", data).Msg("Sending Body data ")
+	bot.Log.Debug().Any("request", body).Msg("Sending Body data ")
 	// Build searchURL string from config
-	searchURL := bot.Config.AI.Endpoints["image"].Host + ":" + string(bot.Config.AI.Endpoints["image"].Port) + "/" + bot.Config.AI.Endpoints["image"].Url
-	resp, err := client.Post(searchURL, "application/json", bytes.NewBuffer([]byte(data)))
+	//searchURL := bot.Config.AI.Endpoints["image"].Host + ":" + string(bot.Config.AI.Endpoints["image"].Port) + "/" + bot.Config.AI.Endpoints["image"].Url
+	//resp, err := client.Post(searchURL, "application/json", bytes.NewBuffer([]byte(data)))
+	//if err != nil {
+	//	bot.Log.Error().
+	//		Err(err).
+	//		Msg("Error making request to Image generation API")
+	//	return
+	//}
+	// defer closing of the body to close off HTTP session
+	//defer func(Body io.ReadCloser) {
+	//	err := Body.Close()
+	//	if err != nil {
+	//		bot.Log.Error().
+	//			Err(err).
+	//			Msg("An error occurred closing Body")
+	//		return
+	//	}
+	//}(resp.Body)
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion("eu-west-2"),
+	)
 	if err != nil {
-		bot.Log.Error().
-			Err(err).
-			Msg("Error making request to Image generation API")
+		bot.Log.Error().Err(err).Msg("Error loading AWS config")
 		return
 	}
-	// defer closing of the body to close off HTTP session
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			bot.Log.Error().
-				Err(err).
-				Msg("An error occurred closing Body")
-			return
-		}
-	}(resp.Body)
+
+	client := bedrockruntime.NewFromConfig(cfg)
+
+	modelOutput, err := client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{
+		ModelId:     aws.String(bot.Config.AI.Endpoints["image"].Model),
+		ContentType: aws.String("application/json"),
+		Body:        body,
+	})
+	if err != nil {
+		bot.Log.Error().Err(err).Msg("Error invoking model")
+		return
+	}
+	var response types.TitanImageResponse
+	if err := json.Unmarshal(modelOutput.Body, &response); err != nil {
+		bot.Log.Error().Err(err).Msg("Failed to unmarshal images data from model")
+		return
+	}
+
+	reader := base64.NewDecoder(base64.StdEncoding, strings.NewReader(response.Images[0]))
 
 	// First we need a MXC URI from the server to upload to
 	MXCResponse, err := bot.Client.CreateMXC(ctx)
@@ -645,7 +726,7 @@ func (bot *MatrixBot) handleGenerateImage(ctx context.Context, message *event.Me
 	encryptedFile := attachment.NewEncryptedFile()
 
 	//Read image from imgData
-	encCloser := encryptedFile.EncryptStream(resp.Body)
+	encCloser := encryptedFile.EncryptStream(reader)
 
 	// Save image into imgData variable
 	imgEncData, err := io.ReadAll(encCloser)
@@ -666,7 +747,7 @@ func (bot *MatrixBot) handleGenerateImage(ctx context.Context, message *event.Me
 	mediaUpload := mautrix.ReqUploadMedia{
 		ContentBytes:      imgEncData,
 		ContentLength:     int64(len(imgEncData)),
-		ContentType:       "image/jpeg",
+		ContentType:       "image/png",
 		MXC:               MXCResponse.ContentURI,
 		UnstableUploadURL: MXCResponse.UnstableUploadURL,
 	}
@@ -718,61 +799,24 @@ func (bot *MatrixBot) handleGenerateImage(ctx context.Context, message *event.Me
 // If the room already has a context, it updates the existing context.
 // Returns an error if there was a problem acquiring the database connection or inserting the context.
 // Acquires a database connection, inserts or updates the context in the database, and releases the connection.
-func (bot *MatrixBot) SaveContext(ctx context.Context, room id.RoomID) error {
-	db, err := bot.Database.Acquire(ctx)
-	if err != nil {
-		bot.Log.Error().
-			Err(err).
-			Msg("Error acquiring database connection")
+func (bot *MatrixBot) SaveContext(room id.RoomID) error {
+	if err := Handler.SaveContext(room); err != nil {
+		bot.Log.Error().Err(err).Msg("Context could not be saved, will not survive a restart")
 		return err
 	}
-
-	_, err = db.Exec(ctx, "INSERT INTO \"Bot-Context\" VALUES ($1, $2) ON CONFLICT(room) DO UPDATE SET context = EXCLUDED.context", room.String(), Contexts[room])
-	if err != nil {
-		bot.Log.Error().
-			Err(err).
-			Msg("Error inserting context to database")
-	}
-
-	db.Release()
 	return nil
 }
 
 // LoadContext loads the context for a given room from the "Bot-Context" table
 // of the database. It acquires a database connection, queries the context from
-// the table, and then stores the context in the Contexts map.
+// the table, and then stores the context in the Handler map.
 // Returns an error if there was a problem acquiring the database connection,
 // querying the table, or scanning the row.
-func (bot *MatrixBot) LoadContext(ctx context.Context, room id.RoomID) error {
-	db, err := bot.Database.Acquire(ctx)
-	if err != nil {
-		bot.Log.Error().
-			Err(err).
-			Msg("Error acquiring database connection")
+func (bot *MatrixBot) LoadContext(room id.RoomID) error {
+	if err := Handler.LoadContext(room); err != nil {
+		bot.Log.Error().Err(err).Msg("Context could not be loaded. Bot will start with new context")
 		return err
 	}
-	row, err := db.Query(ctx, "SELECT context FROM \"Bot-Context\" WHERE room = $1", room.String())
-	if err != nil {
-		bot.Log.Error().
-			Err(err).
-			Msg("Error querying Bot-Context table")
-		return err
-	}
-
-	for row.Next() {
-		var roomContext []int
-		var roomID string
-		err = row.Scan(&roomID, &roomContext)
-		if err != nil {
-			bot.Log.Error().
-				Err(err).
-				Msg("Error scanning row context")
-			return err
-		}
-		Contexts[id.RoomID(roomID)] = roomContext
-	}
-
-	db.Release()
 	return nil
 }
 
@@ -833,81 +877,215 @@ func (bot *MatrixBot) toggleTyping(ctx context.Context, room id.RoomID, isTyping
 // The response is read, parsed, and returned as a map[string]interface{}.
 // The method also updates the bot's context based on the response, if available, and saves it to permanent storage.
 // Finally, it toggles the typing status and returns the full response or an error if any occurred.
-func (bot *MatrixBot) queryAI(ctx context.Context, message string, system string, model string, room id.RoomID) (map[string]interface{}, error) {
-	//Prepare prompt, model and if exist system prompt
+func (bot *MatrixBot) queryAI(ctx context.Context, message string, system string, model string, room id.RoomID) (*types.Message, error) {
+	//Prepare prompt, model, and if it exists, system prompt
 	promptText := strings.ReplaceAll(strings.ReplaceAll(strings.TrimPrefix(message, "query "), bot.Name, ""), "  ", " ")
-	prompt := fmt.Sprintf("%s\n%s\n%s\n%s", UserPromptHeader, promptText, EndOfText, AssistantPromptHeader)
-	rawQuery := NewQuery().
-		WithModel(model).
-		WithPrompt(prompt).
-		WithStream(false).
-		WithSystem(system)
-
-	queryContext, ok := Contexts[room]
-	if ok {
-		rawQuery.WithContext(queryContext)
+	var prompt string
+	var rawQuery Query
+	if Handler.Type == memory.TokenHandler {
+		prompt = fmt.Sprintf("%s\n%s\n%s\n%s", UserPromptHeader, promptText, EndOfText, AssistantPromptHeader)
+		rawQuery = &TokenQuery{
+			AIQuery{
+				Model:  model,
+				System: system,
+				Prompt: prompt,
+			},
+		}
+	} else if Handler.Type == memory.MessageHandler {
+		prompt = promptText
+		messages := make([]MessageQueryMessage, 1)
+		messages[0] = MessageQueryMessage{
+			Role:    "user",
+			Content: []map[string]interface{}{0: {"text": prompt}},
+		}
+		rawQuery = &MessageQuery{
+			Model:    model,
+			Messages: messages,
+		}
+	} else {
+		prompt = promptText
+		rawQuery = &AIQuery{}
 	}
 
-	// Convert AIQuery to an io.Reader that http.Post can handle
-	requestBody := rawQuery.ToIOReader()
+	var queryContext types.RoomContext
+	remainingCharacters := bot.Config.AI.Endpoints["chat"].CharLimit - len(prompt)
+	for _, cont := range Handler.CurrentContext[room].Messages {
+		if remainingCharacters-len(cont.Content[0].Text) < 0 {
+			break
+		}
+		remainingCharacters -= len(cont.Content[0].Text)
 
-	// Make the request to AI API
-	client := http.Client{
-		Timeout: time.Duration(bot.Config.AI.Timeout) * time.Minute,
-	}
-	bot.Log.Info().Msg("Sending question to AI, waiting...")
-	//bot.Log.Debug().Msgf("Data: %s", requestBody)
-	resp, err := client.Post(fmt.Sprintf("%s:%s/%s", bot.Config.AI.Endpoints["chat"].Host,
-		bot.Config.AI.Endpoints["chat"].Port, bot.Config.AI.Endpoints["chat"].Url),
-		"application/json", requestBody)
-	if err != nil {
-		bot.Log.Error().
-			Err(err).
-			Msg("Error querying AI")
-		return nil, err
+		queryContext.Messages = append(queryContext.Messages, cont)
 	}
 
-	// We should now have the answer from the bot. Defer closing of the connection until we've read the data
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
+	rawQuery.WithContext(queryContext)
+
+	Handler.UpdateCurrentContext(room, types.RoomContext{
+		Room:     room,
+		Tokens:   nil,
+		Messages: []types.Message{{Role: "user", Content: []types.Content{{Text: prompt}}}},
+	})
+
+	var fullResponse map[string]interface{}
+	if Handler.Type == memory.TokenHandler {
+		// Convert AIQuery to an io.Reader that http.Post can handle
+		requestBody := rawQuery.ToIOReader()
+
+		// Make the request to AI API
+		client := http.Client{
+			Timeout: time.Duration(bot.Config.AI.Timeout) * time.Minute,
+		}
+		bot.Log.Info().Msg("Sending question to AI, waiting...")
+		//bot.Log.Debug().Msgf("Data: %s", requestBody)
+		resp, err := client.Post(fmt.Sprintf("%s:%s/%s", bot.Config.AI.Endpoints["chat"].Host,
+			bot.Config.AI.Endpoints["chat"].Port, bot.Config.AI.Endpoints["chat"].Url),
+			"application/json", requestBody)
 		if err != nil {
 			bot.Log.Error().
 				Err(err).
-				Msg("Problem closing connection to AI")
+				Msg("Error querying AI")
+			return nil, err
 		}
-	}(resp.Body)
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		bot.Log.Error().Err(err).Msg("Error reading answer from AI")
-		return nil, err
-	}
+		// We should now have the answer from the bot. Defer closing of the connection until we've read the data
+		defer func(Body io.ReadCloser) {
+			err := Body.Close()
+			if err != nil {
+				bot.Log.Error().
+					Err(err).
+					Msg("Problem closing connection to AI")
+			}
+		}(resp.Body)
 
-	var fullResponse map[string]interface{}
-	err = json.Unmarshal(body, &fullResponse)
-	if err != nil {
-		bot.Log.Error().Err(err).Msg("Can't unmarshal JSON response from AI")
-		return nil, err
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			bot.Log.Error().Err(err).Msg("Error reading answer from AI")
+			return nil, err
+		}
+
+		err = json.Unmarshal(body, &fullResponse)
+		if err != nil {
+			bot.Log.Error().Err(err).Msg("Can't unmarshal JSON response from AI")
+			return nil, err
+		}
+	} else if Handler.Type == memory.MessageHandler {
+		cfg, err := config.LoadDefaultConfig(ctx,
+			config.WithRegion("eu-west-2"),
+		)
+		if err != nil {
+			bot.Log.Error().Err(err).Msg("Error loading AWS config")
+			return nil, err
+
+		}
+		// endpoint := bot.Config.AI.Endpoints["chat"].Host
+		// Create a AWS client object to talk to Bedrock
+		// client := bedrockruntime.NewFromConfig(cfg, func(options *bedrockruntime.Options) { options.BaseEndpoint = &endpoint })
+		client := bedrockruntime.NewFromConfig(cfg)
+
+		// Do a whole lot of type conversion to make AWS SDK happy
+		query := rawQuery.(*MessageQuery)
+		messageSlice := make([]bedrocktypes.Message, len(query.Messages))
+		for index, block := range query.Messages {
+			contentSlice := make([]bedrocktypes.ContentBlock, len(block.Content))
+			for i, content := range block.Content {
+				contentSlice[i] = &bedrocktypes.ContentBlockMemberText{
+					Value: content["text"].(string),
+				}
+			}
+			messageSlice[index] = bedrocktypes.Message{
+				Role:    bedrocktypes.ConversationRole(block.Role),
+				Content: contentSlice,
+			}
+		}
+		messageSlice = slices.Clip(messageSlice)
+
+		// Create the input object to use after all conversion
+		converseInput := bedrockruntime.ConverseInput{
+			Messages:                          messageSlice,
+			ModelId:                           bot.Config.AI.Endpoints["chat"].GetModelRef(),
+			AdditionalModelRequestFields:      nil,
+			AdditionalModelResponseFieldPaths: nil,
+			GuardrailConfig:                   nil,
+			InferenceConfig:                   nil,
+			System:                            nil,
+			ToolConfig:                        nil,
+		}
+		var bedrockResponse *bedrockruntime.ConverseOutput
+		if bedrockResponse, err = client.Converse(ctx, &converseInput); err != nil {
+			bot.Log.Error().Err(err).Msg("Error conversing with AWS Bedrock")
+			return nil, err
+		}
+
+		// Then to convert back into our own datatypes some hadoken code is necessary below
+		output := bedrockResponse.Output.(*bedrocktypes.ConverseOutputMemberMessage).Value.Content[0].(*bedrocktypes.ContentBlockMemberText).Value
+		fullResponse = map[string]interface{}{
+			"output": map[string]interface{}{
+				"message": map[string]interface{}{
+					"content": []map[string]interface{}{
+						0: {
+							"text": output,
+						},
+					},
+				},
+			},
+		}
 	}
 
 	bot.Log.Info().Msg("Updating Context")
-	var botContext []int
-	if rawContext, ok := fullResponse["context"]; ok {
-		bot.Log.Debug().Msg("Retrieving Context from AI")
-		for _, v := range rawContext.([]interface{}) {
-			botContext = append(botContext, int(v.(float64)))
+	var botContext types.RoomContext
+	var err error
+	if Handler.Type == memory.TokenHandler {
+		if rawContext, ok := fullResponse["context"]; ok {
+			bot.Log.Debug().Msg("Retrieving Context from AI")
+			for _, v := range rawContext.([]json.Number) {
+				var tmp int64
+				if tmp, err = v.Int64(); err != nil {
+					bot.Log.Error().Err(err).Msg("Error converting Json Number to Int64")
+				}
+				botContext.Tokens = append(botContext.Tokens, int(tmp))
+			}
+		}
+	} else if Handler.Type == memory.MessageHandler {
+		if rawContext, ok := fullResponse["output"].(map[string]interface{}); ok {
+			if _, ok := rawContext["message"]; ok {
+				content := types.Content{Text: rawContext["message"].(map[string]interface{})["content"].([]map[string]interface{})[0]["text"].(string)}
+				botContext.Messages = append(botContext.Messages, types.Message{
+					Role:    "assistant",
+					Content: []types.Content{content},
+				})
+			}
 		}
 	}
-	bot.Log.Debug().Msg("Updating Init Bot Context and saving to permanent storage")
-	Contexts[room] = botContext
+	Handler.UpdateCurrentContext(room, botContext)
 	go func() {
-		err := bot.SaveContext(ctx, room)
+		err := bot.SaveContext(room)
 		if err != nil {
 			bot.Log.Warn().Err(err).Msg("Context will not survive restart")
 		}
 	}()
 
-	return fullResponse, nil
+	var returnMessage types.Message
+	if Handler.Type == memory.TokenHandler {
+		content := types.Content{
+			Text:     fullResponse[bot.Config.AI.Endpoints["chat"].ResponseKey].(string),
+			Image:    nil,
+			Document: nil,
+		}
+		returnMessage = types.Message{
+			Role:    "assistant",
+			Content: []types.Content{content},
+		}
+	} else if Handler.Type == memory.MessageHandler {
+		content := types.Content{Text: fullResponse["output"].(map[string]interface{})["message"].(map[string]interface{})["content"].([]map[string]interface{})[0]["text"].(string)}
+		returnMessage = types.Message{
+			Role:    "assistant",
+			Content: []types.Content{content},
+		}
+	} else {
+		returnMessage = types.Message{}
+	}
+
+	return &returnMessage, nil
 }
 
 // regexTrimLeft trims the left side of a string haystack using a regular expression pattern
@@ -986,4 +1164,66 @@ func (bot *MatrixBot) qualifySearch(documents []string, userPrompt string) []int
 		}
 	}
 	return approvedDocs
+}
+
+// signAPIRequest signs an API request using AWS Signature Version 4 signing process.
+// It prepares an HTTP POST request with the provided data and URL, and then signs it using AWS credentials.
+// If any error occurs during this process, it is returned.
+//
+// Parameters:
+// ctx:  The context to be used for the request. It carries request-scoped values, deadlines, and cancelation signals.
+// data: The payload to be included in the body of the POST request.
+// url:  The endpoint URL to which the request will be sent.
+//
+// Returns:
+// *http.Request: The signed HTTP request ready to be sent.
+// error: Any error encountered during the process.
+//
+// The function performs the following steps:
+// 1. Load the default AWS config.
+// 2. Retrieve the credentials from the config.
+// 3. Create a new HTTP POST request with the provided data and URL.
+// 4. Compute the SHA-256 hash of the data.
+// 5. Sign the request using AWS Signature Version 4 with the provided credentials and hash.
+// 6. Return the signed request, or an error if any step fails.
+func signAPIRequest(ctx context.Context, data string, url string, log zerolog.Logger) (*http.Request, error) {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion("eu-west-2"))
+	log.Debug().Msg("Signing request with AWS Signature Version 4")
+	if err != nil {
+		return nil, err
+	}
+
+	credentials, err := cfg.Credentials.Retrieve(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer([]byte(data)))
+	if err != nil {
+		return nil, err
+	}
+
+	// Associate the request with the given context to ensure it adheres to the
+	// context's deadlines, cancelation signals, and other request-scoped values.
+	req = req.WithContext(ctx)
+
+	// Compute the SHA-256 hash of the data to be included in the body of the POST request.
+	hash := sha256.Sum256([]byte(data))
+
+	// Format the hash as a hexadecimal string.
+	hexHash := fmt.Sprintf("%x", hash)
+
+	// Create a new AWS Signature Version 4 signer which will be used to sign the request.
+	signer := v4.NewSigner()
+
+	// Sign the HTTP request using the signer, AWS credentials, the hex hash of the data,
+	// and other necessary parameters like service name and region.
+	// This ensures the request is authenticated and authorized to interact with the specified endpoint.
+	err = signer.SignHTTP(ctx, credentials, req, hexHash, "execute-api", cfg.Region, time.Now())
+	if err != nil {
+		return nil, err
+	}
+
+	// Return the signed request, ready to be sent, and a nil error indicating success.
+	return req, nil
 }

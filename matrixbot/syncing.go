@@ -13,7 +13,7 @@ func SetupSyncer(bot *MatrixBot) (MatrixBot, error) {
 	// Setup new syncer using the Client set in the bot
 	syncer := bot.Client.Syncer.(*mautrix.DefaultSyncer)
 
-	//Handle messages send to the channel
+	//Handle message send to the channel
 	syncer.OnEventType(event.EventMessage, func(ctx context.Context, ev *event.Event) {
 		messageEvent := ev.Content.AsMessage()
 
@@ -31,7 +31,7 @@ func SetupSyncer(bot *MatrixBot) (MatrixBot, error) {
 			bot.handleCommands(ctx, messageEvent, ev.RoomID, ev.Sender)
 
 		} else {
-			bot.Log.Debug().Msg("Message not for bot")
+			bot.Log.Debug().Msg("Messages not for bot")
 		}
 
 	})
