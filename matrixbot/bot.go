@@ -306,7 +306,7 @@ func NewMatrixBot(config types.Config, log *zerolog.Logger) (*MatrixBot, error) 
 	if config.AI.Endpoints["image"].Use {
 		bot.RegisterCommand("bildgenerering", 0, "Generate an image via AI and send to the Matrix Chat Room", bot.handleGenerateImage)
 	}
-	bot.RegisterCommand("", 0, "Default action is to Query the AI", bot.handleQueryAI)
+	bot.RegisterCommand("chat", 0, "Default action is to Query the AI", bot.handleQueryAI)
 
 	return bot, nil
 }
@@ -1204,7 +1204,7 @@ func signAPIRequest(ctx context.Context, data string, url string, log zerolog.Lo
 	}
 
 	// Associate the request with the given context to ensure it adheres to the
-	// context's deadlines, cancelation signals, and other request-scoped values.
+	// context's deadlines, cancellation signals, and other request-scoped values.
 	req = req.WithContext(ctx)
 
 	// Compute the SHA-256 hash of the data to be included in the body of the POST request.
