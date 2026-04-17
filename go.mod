@@ -3,7 +3,7 @@ module init-bot
 go 1.24.0
 
 require (
-	github.com/jackc/pgx/v5 v5.5.5
+	github.com/jackc/pgx/v5 v5.9.0
 	github.com/mattn/go-sqlite3 v1.14.22
 	github.com/rs/zerolog v1.32.0
 	go.mau.fi/util v0.4.1
